@@ -2,22 +2,23 @@
 # avm: try Aneuu in a QEMU virtual machine (run from the folder with aneuu-out/)
 #
 #   avm                 live USB test: 64-bit ISO, BIOS, 2 GB memory
-#   avm 32              the 32-bit ISO on an old netbook CPU (Atom N270), 1 GB
+#   avm 32              the 32-bit ISO on an old netbook CPU (Atom N270), 2 GB
 #   avm uefi            start with UEFI instead of BIOS (64-bit only)
 #   avm disk            also an empty 20 GB hard disk, to test han-inst
 #   avm hd              start the installed hard disk, without the ISO
 #   avm usb             also plug in a test USB stick with Korean file names
 #   avm pass 8087:0a2b  give a real USB device to the VM (Bluetooth or Wi-Fi
 #                       dongle, or the laptop's own Bluetooth): see lsusb
-#   avm mem 512         memory in MB (old laptops: 512, 1024)
+#   avm mem 4096        memory in MB (Aneuu needs at least 2048)
 #   avm iso FILE        another ISO
 #   avm fs              start full screen (Ctrl+Alt+F switches any time)
 #
 # Words combine:  avm 32 disk usb mem 512     DRY=1 avm ...  only prints it
-# The window opens at 50% of the screen width, scaled (ZOOM=60 avm: bigger,
-# ZOOM=0 avm: QEMU's normal size). The screen keeps 4:3 always, also full
-# screen (black bars at the sides). Ctrl+Alt+F full screen on/off,
-# Ctrl+Alt+G frees the mouse. UI=gtk avm: QEMU's old window with menus.
+# The window is QEMU's GTK window with menus, at 55% of the screen width,
+# scaled (ZOOM=65 avm: bigger, ZOOM=0 avm: QEMU's normal size). Ctrl+Alt+F
+# full screen on/off (GTK stretches it), Ctrl+Alt+G frees the mouse.
+# UI=sdl avm: the plain SDL window, which keeps 4:3 in full screen too
+# (black bars at the sides).
 set -eu
 
 arch=64 fw=bios mem="" disk=no boot=iso usb=no pass="" iso="" fs=off
@@ -41,7 +42,7 @@ done
 
 if [ $arch = 32 ]; then
 	Q=qemu-system-i386 cpu=n270
-	: "${mem:=1024}" "${iso:=aneuu-out/aneuu-0-x86.iso}"
+	: "${mem:=2048}" "${iso:=aneuu-out/aneuu-0-x86.iso}"
 	[ $fw = bios ] || { echo "avm: 32-bit is tested with BIOS only" >&2; exit 1; }
 	DISK=aneuu-disk32.qcow2
 else
@@ -66,7 +67,7 @@ fi
 # SDL, not GTK: QEMU's GTK window stretches 4:3 to the whole screen in full
 # screen; SDL keeps 4:3 (bars at the sides). It has no menu bar either, so
 # Alt+V and F10 reach the VM.
-if [ "${UI:-sdl}" = gtk ]; then
+if [ "${UI:-gtk}" = gtk ]; then
 	ui="gtk,zoom-to-fit=on,full-screen=$fs"
 else
 	ui="sdl,full-screen=$fs"
@@ -134,7 +135,7 @@ done
 if [ "${DRY:-}" = 1 ]; then echo $Q "$@"; exit 0; fi
 # Make the window big; with zoom-to-fit QEMU scales the screen to it.
 # Find it by QEMU's process id: a title search can hit the terminal too.
-z="${ZOOM:-50}"
+z="${ZOOM:-55}"
 if [ "$z" != 0 ] && [ $fs = off ] && command -v xdotool >/dev/null 2>&1; then
 	$Q "$@" &
 	pid=$!
@@ -147,7 +148,7 @@ if [ "$z" != 0 ] && [ $fs = off ] && command -v xdotool >/dev/null 2>&1; then
 	if [ -n "$w" ]; then
 		set -- $(xdotool getdisplaygeometry)
 		# a 4:3 screen (plus the menu bar of the GTK window)
-		mb=0; [ "${UI:-sdl}" = gtk ] && mb=30
+		mb=0; [ "${UI:-gtk}" = gtk ] && mb=30
 		ww=$(($1 * z / 100)); wh=$((ww * 3 / 4 + mb))
 		xdotool windowmove "$w" $(($1 / 40)) $(($2 / 40))
 		xdotool windowsize "$w" "$ww" "$wh"
