@@ -1,0 +1,695 @@
+diff --git a/netsurf/frontends/framebuffer/Makefile b/netsurf/frontends/framebuffer/Makefile
+index 7408f0c..0718616 100644
+--- a/netsurf/frontends/framebuffer/Makefile
++++ b/netsurf/frontends/framebuffer/Makefile
+@@ -173,7 +173,7 @@ $(eval $(foreach V,$(filter FB_FONT_$(NETSURF_FB_FONTLIB)_%,$(.VARIABLES)),$(cal
+ 
+ # S_FRONTEND are sources purely for the framebuffer build
+ S_FRONTEND := gui.c framebuffer.c schedule.c bitmap.c fetch.c	\
+-	findfile.c corewindow.c local_history.c clipboard.c
++	findfile.c corewindow.c local_history.c clipboard.c hangul.c
+ 
+ # toolkit sources
+ S_FRAMEBUFFER_FBTK := fbtk.c event.c fill.c bitmap.c user.c window.c 	\
+diff --git a/netsurf/frontends/framebuffer/fbtk/text.c b/netsurf/frontends/framebuffer/fbtk/text.c
+index 9c96dce..da69926 100644
+--- a/netsurf/frontends/framebuffer/fbtk/text.c
++++ b/netsurf/frontends/framebuffer/fbtk/text.c
+@@ -36,6 +36,7 @@
+ #include "framebuffer/font.h"
+ #include "framebuffer/framebuffer.h"
+ #include "framebuffer/image_data.h"
++#include "framebuffer/hangul.h"
+ 
+ #include "widget.h"
+ 
+@@ -292,6 +293,94 @@ fb_text_input_remove_caret_cb(fbtk_widget_t *widget)
+ 	}
+ }
+ 
++/* The text is UTF-8: move and edit by character, not by byte. */
++
++/** \return the index of the character before the caret. */
++static int text_prev(fbtk_widget_t *widget)
++{
++	int idx = widget->u.text.idx;
++
++	if (idx <= 0)
++		return 0;
++	do {
++		idx--;
++	} while (idx > 0 && (widget->u.text.text[idx] & 0xC0) == 0x80);
++	return idx;
++}
++
++/** \return the index of the character after the caret. */
++static int text_next(fbtk_widget_t *widget)
++{
++	int idx = widget->u.text.idx;
++
++	if (idx >= widget->u.text.len)
++		return widget->u.text.len;
++	do {
++		idx++;
++	} while (idx < widget->u.text.len &&
++		 (widget->u.text.text[idx] & 0xC0) == 0x80);
++	return idx;
++}
++
++/** Delete the character before the caret. */
++static void text_delete_left(fbtk_widget_t *widget)
++{
++	int from = text_prev(widget);
++	int n = widget->u.text.idx - from;
++
++	if (n <= 0)
++		return;
++	memmove(widget->u.text.text + from,
++		widget->u.text.text + widget->u.text.idx,
++		widget->u.text.len - widget->u.text.idx);
++	widget->u.text.idx = from;
++	widget->u.text.len -= n;
++	widget->u.text.text[widget->u.text.len] = '\0';
++}
++
++/** Insert a character, as UTF-8, at the caret. \return false on failure. */
++static bool text_insert_ucs4(fbtk_widget_t *widget, uint32_t c)
++{
++	char utf8[4];
++	int n;
++	char *temp;
++
++	if (c < 0x80) {
++		utf8[0] = c;
++		n = 1;
++	} else if (c < 0x800) {
++		utf8[0] = 0xC0 | (c >> 6);
++		utf8[1] = 0x80 | (c & 0x3F);
++		n = 2;
++	} else if (c < 0x10000) {
++		utf8[0] = 0xE0 | (c >> 12);
++		utf8[1] = 0x80 | ((c >> 6) & 0x3F);
++		utf8[2] = 0x80 | (c & 0x3F);
++		n = 3;
++	} else {
++		utf8[0] = 0xF0 | (c >> 18);
++		utf8[1] = 0x80 | ((c >> 12) & 0x3F);
++		utf8[2] = 0x80 | ((c >> 6) & 0x3F);
++		utf8[3] = 0x80 | (c & 0x3F);
++		n = 4;
++	}
++
++	/* allow for the new character and the terminator */
++	temp = realloc(widget->u.text.text, widget->u.text.len + n + 1);
++	if (temp == NULL)
++		return false;
++
++	widget->u.text.text = temp;
++	memmove(widget->u.text.text + widget->u.text.idx + n,
++		widget->u.text.text + widget->u.text.idx,
++		widget->u.text.len - widget->u.text.idx);
++	memcpy(widget->u.text.text + widget->u.text.idx, utf8, n);
++	widget->u.text.idx += n;
++	widget->u.text.len += n;
++	widget->u.text.text[widget->u.text.len] = '\0';
++	return true;
++}
++
+ /** Routine called when text events occour in writeable widget.
+  *
+  * @param widget The widget reciving input events.
+@@ -303,7 +392,8 @@ text_input(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ {
+ 	int value;
+ 	static fbtk_modifier_type modifier = FBTK_MOD_CLEAR;
+-	char *temp;
++	struct fb_hangul_edit hedit;
++	int hi;
+ 	plot_font_style_t font_style;
+ 	int fh;
+ 	int border;
+@@ -345,16 +435,28 @@ text_input(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 		return 0;
+ 	}
+ 
++	/* Korean input: the syllable in progress is replaced */
++	if (fb_hangul_key(value, modifier, &hedit)) {
++		if (hedit.del > 0)
++			text_delete_left(widget);
++		for (hi = 0; hi < hedit.n; hi++)
++			text_insert_ucs4(widget, hedit.ins[hi]);
++
++		fb_font_width(&font_style, widget->u.text.text,
++				widget->u.text.len, &widget->u.text.width);
++		caret_moved = true;
++		value = NSFB_KEY_UNKNOWN;
++	}
++
+ 	switch (value) {
++	case NSFB_KEY_UNKNOWN:
++		/* handled above */
++		break;
++
+ 	case NSFB_KEY_BACKSPACE:
+ 		if (widget->u.text.idx <= 0)
+ 			break;
+-		memmove(widget->u.text.text + widget->u.text.idx - 1,
+-				widget->u.text.text + widget->u.text.idx,
+-				widget->u.text.len - widget->u.text.idx);
+-		widget->u.text.idx--;
+-		widget->u.text.len--;
+-		widget->u.text.text[widget->u.text.len] = 0;
++		text_delete_left(widget);
+ 
+ 		fb_font_width(&font_style, widget->u.text.text,
+ 				widget->u.text.len, &widget->u.text.width);
+@@ -369,7 +471,7 @@ text_input(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 	case NSFB_KEY_RIGHT:
+ 		if (widget->u.text.idx < widget->u.text.len) {
+ 			if (modifier == FBTK_MOD_CLEAR)
+-				widget->u.text.idx++;
++				widget->u.text.idx = text_next(widget);
+ 			else
+ 				widget->u.text.idx = widget->u.text.len;
+ 
+@@ -380,7 +482,7 @@ text_input(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 	case NSFB_KEY_LEFT:
+ 		if (widget->u.text.idx > 0) {
+ 			if (modifier == FBTK_MOD_CLEAR)
+-				widget->u.text.idx--;
++				widget->u.text.idx = text_prev(widget);
+ 			else
+ 				widget->u.text.idx = 0;
+ 
+@@ -442,22 +544,11 @@ text_input(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 			break;
+ 		}
+ 
+-		/* allow for new character and null */
+-		temp = realloc(widget->u.text.text, widget->u.text.len + 2);
+-		if (temp == NULL) {
++		hi = fbtk_keycode_to_ucs4(value, modifier);
++		if (hi < 0x20 || !text_insert_ucs4(widget, hi)) {
+ 			break;
+ 		}
+ 
+-		widget->u.text.text = temp;
+-		memmove(widget->u.text.text + widget->u.text.idx + 1,
+-				widget->u.text.text + widget->u.text.idx,
+-				widget->u.text.len - widget->u.text.idx);
+-		widget->u.text.text[widget->u.text.idx] =
+-				fbtk_keycode_to_ucs4(value, modifier);
+-		widget->u.text.idx++;
+-		widget->u.text.len++;
+-		widget->u.text.text[widget->u.text.len] = '\0';
+-
+ 		fb_font_width(&font_style, widget->u.text.text,
+ 				widget->u.text.len, &widget->u.text.width);
+ 		caret_moved = true;
+@@ -495,6 +586,8 @@ text_input_click(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 
+ 	fb_text_font_style(widget, &fh, &border, &font_style);
+ 
++	fb_hangul_reset();
++
+ 	widget->u.text.idx = widget->u.text.len;
+ 
+ 	fb_font_position(&font_style, widget->u.text.text,
+diff --git a/netsurf/frontends/framebuffer/gui.c b/netsurf/frontends/framebuffer/gui.c
+index 934ba05..47e7fb5 100644
+--- a/netsurf/frontends/framebuffer/gui.c
++++ b/netsurf/frontends/framebuffer/gui.c
+@@ -55,6 +55,7 @@
+ #include "framebuffer/fetch.h"
+ #include "framebuffer/bitmap.h"
+ #include "framebuffer/local_history.h"
++#include "framebuffer/hangul.h"
+ 
+ 
+ #define NSFB_TOOLBAR_DEFAULT_LAYOUT "blfsrutc"
+@@ -662,6 +663,9 @@ fb_browser_window_click(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ 		uint64_t time;
+ 	} last_click;
+ 
++	/* a click ends the Korean syllable in progress */
++	fb_hangul_reset();
++
+ 	if (cbi->event->type != NSFB_EVENT_KEY_DOWN &&
+ 	    cbi->event->type != NSFB_EVENT_KEY_UP)
+ 		return 0;
+@@ -846,17 +850,39 @@ fb_browser_window_move(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ }
+ 
+ 
++/** Shows the Korean/English state in the status bar. */
++static void fb_hangul_notify(bool korean, void *pw)
++{
++	struct gui_window *gw = pw;
++
++	fbtk_set_text(gw->status, korean ?
++		      "\xed\x95\x9c\xea\xb8\x80  (Right Alt: English)" :
++		      "English  (Right Alt: \xed\x95\x9c\xea\xb8\x80)");
++}
++
+ static int
+ fb_browser_window_input(fbtk_widget_t *widget, fbtk_callback_info *cbi)
+ {
+ 	struct gui_window *gw = cbi->context;
+ 	static fbtk_modifier_type modifier = FBTK_MOD_CLEAR;
+ 	int ucs4 = -1;
++	struct fb_hangul_edit hedit;
++	int hi;
+ 
+ 	NSLOG(netsurf, INFO, "got value %d", cbi->event->value.keycode);
+ 
+ 	switch (cbi->event->type) {
+ 	case NSFB_EVENT_KEY_DOWN:
++		/* Korean input: the syllable in progress is replaced */
++		if (fb_hangul_key(cbi->event->value.keycode, modifier, &hedit)) {
++			if (hedit.del > 0)
++				browser_window_key_press(gw->bw,
++							 NS_KEY_DELETE_LEFT);
++			for (hi = 0; hi < hedit.n; hi++)
++				browser_window_key_press(gw->bw, hedit.ins[hi]);
++			break;
++		}
++
+ 		switch (cbi->event->value.keycode) {
+ 
+ 		case NSFB_KEY_DELETE:
+@@ -1677,6 +1703,7 @@ create_normal_browser_window(struct gui_window *gw, int furniture_width)
+ 				      FB_FRAME_COLOUR, FB_COLOUR_BLACK,
+ 				      false);
+ 	fbtk_set_handler(gw->status, FBTK_CBT_POINTERENTER, set_ptr_default_move, NULL);
++	fb_hangul_set_notify(fb_hangul_notify, gw);
+ 
+ 	NSLOG(netsurf, INFO, "status bar %p at %d,%d", gw->status,
+ 	      fbtk_get_absx(gw->status), fbtk_get_absy(gw->status));
+@@ -1851,6 +1878,9 @@ gui_window_destroy(struct gui_window *gw)
+ {
+ 	gui_window_remove_from_window_list(gw);
+ 
++	fb_hangul_set_notify(NULL, NULL);
++	fb_hangul_reset();
++
+ 	fbtk_destroy_widget(gw->window);
+ 
+ 	free(gw);
+diff --git a/netsurf/frontends/framebuffer/hangul.c b/netsurf/frontends/framebuffer/hangul.c
+new file mode 100644
+index 0000000..fb7396e
+--- /dev/null
++++ b/netsurf/frontends/framebuffer/hangul.c
+@@ -0,0 +1,319 @@
++/*
++ * Korean (Hangul) input for the NetSurf framebuffer frontend.
++ * See hangul.h. Licensed under the GNU General Public License, version 2,
++ * like NetSurf.
++ */
++
++#include <stddef.h>
++
++#include "framebuffer/hangul.h"
++
++#ifndef FB_HANGUL_TEST
++#include <libnsfb.h>
++#include <libnsfb_plot.h>
++#include <libnsfb_event.h>
++
++#include "netsurf/browser_window.h"
++#include "framebuffer/gui.h"
++#include "framebuffer/fbtk.h"
++#endif
++
++#define NONE (-1)
++
++static struct {
++	bool on;
++	int cho, jung, jong;  /* indices; NONE, and jong 0, mean absent */
++	bool shown;           /* the syllable in progress is in the field */
++	void (*notify)(bool korean, void *pw);
++	void *notify_pw;
++} ime = { false, NONE, NONE, 0, false, NULL, NULL };
++
++/* 2-beolsik: key to initial consonant index, or NONE */
++static int key_cho(int ch)
++{
++	switch (ch) {
++	case 'r': return 0;   case 'R': return 1;   case 's': case 'S': return 2;
++	case 'e': return 3;   case 'E': return 4;   case 'f': case 'F': return 5;
++	case 'a': case 'A': return 6;
++	case 'q': return 7;   case 'Q': return 8;
++	case 't': return 9;   case 'T': return 10;  case 'd': case 'D': return 11;
++	case 'w': return 12;  case 'W': return 13;  case 'c': case 'C': return 14;
++	case 'z': case 'Z': return 15;  case 'x': case 'X': return 16;
++	case 'v': case 'V': return 17;  case 'g': case 'G': return 18;
++	}
++	return NONE;
++}
++
++/* 2-beolsik: key to vowel index, or NONE */
++static int key_jung(int ch)
++{
++	switch (ch) {
++	case 'k': case 'K': return 0;   case 'o': return 1;
++	case 'i': case 'I': return 2;   case 'O': return 3;
++	case 'j': case 'J': return 4;   case 'p': return 5;
++	case 'u': case 'U': return 6;   case 'P': return 7;
++	case 'h': case 'H': return 8;   case 'y': case 'Y': return 12;
++	case 'n': case 'N': return 13;  case 'b': case 'B': return 17;
++	case 'm': case 'M': return 18;  case 'l': case 'L': return 20;
++	}
++	return NONE;
++}
++
++/* initial consonant index to final consonant index (0: cannot be final) */
++static const int cho_to_jong[19] = {
++	1, 2, 4, 7, 0, 8, 16, 17, 0, 19, 20, 21, 22, 0, 23, 24, 25, 26, 27
++};
++
++/* final consonant index to initial consonant index (simple finals) */
++static const int jong_to_cho[28] = {
++	NONE, 0, 1, NONE, 2, NONE, NONE, 3, 5, NONE, NONE, NONE, NONE, NONE,
++	NONE, NONE, 6, 7, NONE, 9, 10, 11, 12, 14, 15, 16, 17, 18
++};
++
++/* compound finals: {first, second, compound} as final indices */
++static const int jong_pair[][3] = {
++	{ 1, 19, 3 },  { 4, 22, 5 },  { 4, 27, 6 },  { 8, 1, 9 },
++	{ 8, 16, 10 }, { 8, 17, 11 }, { 8, 19, 12 }, { 8, 25, 13 },
++	{ 8, 26, 14 }, { 8, 27, 15 }, { 17, 19, 18 }
++};
++
++/* compound vowels: {first, second, compound} */
++static const int jung_pair[][3] = {
++	{ 8, 0, 9 },   { 8, 1, 10 },  { 8, 20, 11 }, { 13, 4, 14 },
++	{ 13, 5, 15 }, { 13, 20, 16 }, { 18, 20, 19 }
++};
++
++/* initial consonant index to its place in the compatibility jamo block */
++static const int cho_compat[19] = {
++	0, 1, 3, 6, 7, 8, 16, 17, 18, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29
++};
++
++#define NPAIR(t) (int)(sizeof(t) / sizeof((t)[0]))
++
++static int combine(const int table[][3], int n, int a, int b)
++{
++	int i;
++	for (i = 0; i < n; i++)
++		if (table[i][0] == a && table[i][1] == b)
++			return table[i][2];
++	return NONE;
++}
++
++/* \return the row whose compound is \a c, or NONE */
++static int split(const int table[][3], int n, int c)
++{
++	int i;
++	for (i = 0; i < n; i++)
++		if (table[i][2] == c)
++			return i;
++	return NONE;
++}
++
++/* the character for the current state, or 0 if nothing is composed */
++static uint32_t current(void)
++{
++	if (ime.cho != NONE && ime.jung != NONE)
++		return 0xAC00 + (ime.cho * 21 + ime.jung) * 28 + ime.jong;
++	if (ime.cho != NONE)
++		return 0x3131 + cho_compat[ime.cho];
++	if (ime.jung != NONE)
++		return 0x314F + ime.jung;
++	return 0;
++}
++
++static void clear(void)
++{
++	ime.cho = ime.jung = NONE;
++	ime.jong = 0;
++}
++
++/* start an edit: the syllable shown so far is replaced */
++static void begin(struct fb_hangul_edit *edit)
++{
++	edit->del = ime.shown ? 1 : 0;
++	edit->n = 0;
++}
++
++static void put(struct fb_hangul_edit *edit, uint32_t c)
++{
++	if (c != 0 && edit->n < 2)
++		edit->ins[edit->n++] = c;
++}
++
++/* finish an edit: show the syllable now in progress */
++static void end(struct fb_hangul_edit *edit)
++{
++	uint32_t c = current();
++	put(edit, c);
++	ime.shown = (c != 0);
++}
++
++void fb_hangul_set_notify(void (*cb)(bool korean, void *pw), void *pw)
++{
++	ime.notify = cb;
++	ime.notify_pw = pw;
++}
++
++bool fb_hangul_active(void)
++{
++	return ime.on;
++}
++
++void fb_hangul_reset(void)
++{
++	clear();
++	ime.shown = false;
++}
++
++bool fb_hangul_toggle(void)
++{
++	fb_hangul_reset();
++	ime.on = !ime.on;
++	if (ime.notify != NULL)
++		ime.notify(ime.on, ime.notify_pw);
++	return ime.on;
++}
++
++bool fb_hangul_char(int ch, struct fb_hangul_edit *edit)
++{
++	int c, v, k, row;
++
++	if (!ime.on)
++		return false;
++
++	c = key_cho(ch);
++	v = key_jung(ch);
++	if (c == NONE && v == NONE) {
++		/* not a Hangul key: what is composed stays as it is */
++		fb_hangul_reset();
++		return false;
++	}
++
++	begin(edit);
++
++	if (c != NONE) {
++		if (ime.cho != NONE && ime.jung != NONE) {
++			/* syllable: try the consonant as its final */
++			if (ime.jong == 0 && cho_to_jong[c] != 0) {
++				ime.jong = cho_to_jong[c];
++			} else if (ime.jong != 0 && cho_to_jong[c] != 0 &&
++				   (k = combine(jong_pair, NPAIR(jong_pair),
++						ime.jong, cho_to_jong[c])) != NONE) {
++				ime.jong = k;
++			} else {
++				put(edit, current());
++				clear();
++				ime.cho = c;
++			}
++		} else {
++			/* nothing, a lone consonant or a lone vowel */
++			put(edit, current());
++			clear();
++			ime.cho = c;
++		}
++	} else {
++		if (ime.cho != NONE && ime.jung != NONE && ime.jong != 0) {
++			/* the final (or its second half) starts the next syllable */
++			int next_cho;
++			row = split(jong_pair, NPAIR(jong_pair), ime.jong);
++			if (row != NONE) {
++				ime.jong = jong_pair[row][0];
++				next_cho = jong_to_cho[jong_pair[row][1]];
++			} else {
++				next_cho = jong_to_cho[ime.jong];
++				ime.jong = 0;
++			}
++			put(edit, current());
++			clear();
++			ime.cho = next_cho;
++			ime.jung = v;
++		} else if (ime.jung != NONE) {
++			/* a vowel is there: try a compound vowel */
++			k = combine(jung_pair, NPAIR(jung_pair), ime.jung, v);
++			if (k != NONE) {
++				ime.jung = k;
++			} else {
++				put(edit, current());
++				clear();
++				ime.jung = v;
++			}
++		} else {
++			/* nothing or a lone consonant */
++			ime.jung = v;
++		}
++	}
++
++	end(edit);
++	return true;
++}
++
++bool fb_hangul_backspace(struct fb_hangul_edit *edit)
++{
++	int row;
++
++	if (!ime.on || !ime.shown)
++		return false;
++
++	begin(edit);
++
++	if (ime.cho != NONE && ime.jung != NONE && ime.jong != 0) {
++		row = split(jong_pair, NPAIR(jong_pair), ime.jong);
++		ime.jong = (row != NONE) ? jong_pair[row][0] : 0;
++	} else if (ime.jung != NONE) {
++		row = split(jung_pair, NPAIR(jung_pair), ime.jung);
++		ime.jung = (row != NONE) ? jung_pair[row][0] : NONE;
++	} else {
++		ime.cho = NONE;
++	}
++
++	end(edit);
++	return true;
++}
++
++#ifndef FB_HANGUL_TEST
++bool fb_hangul_key(int keycode, int mods, struct fb_hangul_edit *edit)
++{
++	int ch;
++
++	edit->del = 0;
++	edit->n = 0;
++
++	/* Right Alt, the Hangul key (seen as Mode) or Shift+Space */
++	if (keycode == NSFB_KEY_RALT || keycode == NSFB_KEY_MODE ||
++	    (keycode == NSFB_KEY_SPACE &&
++	     (mods & (FBTK_MOD_LSHIFT | FBTK_MOD_RSHIFT)))) {
++		fb_hangul_toggle();
++		return true;
++	}
++
++	if (!ime.on)
++		return false;
++
++	switch (keycode) {
++	case NSFB_KEY_RSHIFT:
++	case NSFB_KEY_LSHIFT:
++	case NSFB_KEY_RCTRL:
++	case NSFB_KEY_LCTRL:
++	case NSFB_KEY_LALT:
++		/* modifiers do not end the syllable */
++		return false;
++
++	case NSFB_KEY_BACKSPACE:
++		return fb_hangul_backspace(edit);
++	}
++
++	if (mods & (FBTK_MOD_LCTRL | FBTK_MOD_RCTRL)) {
++		fb_hangul_reset();
++		return false;
++	}
++
++	ch = fbtk_keycode_to_ucs4(keycode, mods);
++	if (ch < 0x20 || ch > 0x7e) {
++		/* arrows, return and the like end the syllable */
++		fb_hangul_reset();
++		return false;
++	}
++
++	return fb_hangul_char(ch, edit);
++}
++#endif
+diff --git a/netsurf/frontends/framebuffer/hangul.h b/netsurf/frontends/framebuffer/hangul.h
+new file mode 100644
+index 0000000..ac31518
+--- /dev/null
++++ b/netsurf/frontends/framebuffer/hangul.h
+@@ -0,0 +1,67 @@
++/*
++ * Korean (Hangul) input for the NetSurf framebuffer frontend.
++ * 2-beolsik (Dubeolsik) layout. Right Alt or Shift+Space switches
++ * Korean/English.
++ *
++ * The syllable being composed is kept in the text field as ordinary text:
++ * each key press tells the caller to delete the previous character (when
++ * it was the syllable in progress) and to insert the new characters.
++ */
++
++#ifndef NETSURF_FB_HANGUL_H
++#define NETSURF_FB_HANGUL_H
++
++#include <stdbool.h>
++#include <stdint.h>
++
++/** What the caller must do with the text field after a key. */
++struct fb_hangul_edit {
++	int del;          /**< characters to delete to the left: 0 or 1 */
++	int n;            /**< characters to insert: 0 to 2 */
++	uint32_t ins[2];  /**< UCS4 characters to insert, in order */
++};
++
++/** Switch between Korean and English. \return true if now Korean. */
++bool fb_hangul_toggle(void);
++
++/** \return true if Korean input is on. */
++bool fb_hangul_active(void);
++
++/** Forget the syllable in progress; it stays in the field as typed. */
++void fb_hangul_reset(void);
++
++/**
++ * Feed a typed ASCII character.
++ *
++ * \param ch    the character the key would give in English
++ * \param edit  what to do with the text field
++ * \return true if the key was used for Hangul; false if the caller
++ *         should handle it as usual (the composition is then ended)
++ */
++bool fb_hangul_char(int ch, struct fb_hangul_edit *edit);
++
++/**
++ * Feed a backspace.
++ *
++ * \return true if a syllable was in progress and \a edit says what to
++ *         do; false if the caller should delete as usual
++ */
++bool fb_hangul_backspace(struct fb_hangul_edit *edit);
++
++/**
++ * Give a key press to the input method first.
++ *
++ * Handles the Korean/English switch, backspace inside a syllable and
++ * typed letters.
++ *
++ * \param keycode  libnsfb key code
++ * \param mods     fbtk modifier state (fbtk_modifier_type)
++ * \param edit     what to do with the text field when true is returned
++ * \return true if the key was consumed
++ */
++bool fb_hangul_key(int keycode, int mods, struct fb_hangul_edit *edit);
++
++/** Called when Korean/English changes, to show it to the user. */
++void fb_hangul_set_notify(void (*cb)(bool korean, void *pw), void *pw);
++
++#endif

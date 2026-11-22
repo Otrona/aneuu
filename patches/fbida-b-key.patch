@@ -1,0 +1,10 @@
+--- a/fbi.c	2026-11-18 22:10:04.267994530 +0900
++++ b/fbi.c	2026-11-18 22:10:04.292252591 +0900
+@@ -838,6 +838,7 @@
+ 
+         case XKB_KEY_Page_Up:
+         case XKB_KEY_K:
++        case XKB_KEY_B:		/* Aneuu: b = previous page, like less */
+ 	    if (textreading && f->top > 0) {
+ 		redraw = 1;
+ 		f->top -= f->text_steps;

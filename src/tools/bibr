@@ -1,0 +1,524 @@
+#!/usr/bin/env python3
+# bibr: read the Bible like a book (in hb), where you stopped: a book and
+# chapter of your choice; < > previous / next chapter (into the next book).
+# bibt: today's readings of the "Bible in One Year" plan (1517.org/oneyear:
+# an Old and a New Testament reading each day); < > the day before / after,
+# a: the whole chapters instead of the verses given (and back).
+# Both: in the translation you choose (English ones from Bible Gateway,
+# Korean ones from 대한성서공회 bskorea.or.kr), asked the first time and
+# with c; Alt+W writes notes in WordGrinder (shown here when saved); F11
+# shows the same text at the same place. Kept in ~/bible/ (.wg and .odt).
+#   bibr                 go on where you stopped     bibr -c   choose
+#   bibr john 3          John 3          bibr 요한복음 3
+#   bibt                 today's readings             bibt 2026-12-24
+#   bibr --check         try chapter 1 of every book in Korean (site check)
+import datetime, html, json, os, re, subprocess, sys, urllib.parse
+
+KO = bool(os.environ.get("HAN_ACTIVE"))
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "han")
+TOOL = "bibt" if os.path.basename(sys.argv[0]).startswith("bibt") else "bibr"
+LAST = os.path.join(CONF, TOOL + ".json")
+DIR = os.path.expanduser("~/bible/read")
+DAILY = os.path.expanduser("~/bible/daily")
+PLAN = "https://www.1517.org/oneyear?dates={ms}"
+WEB2WG = "/usr/local/lib/han/web2wg"
+Y, C, D, R = "\033[1;33m", "\033[36m", "\033[2m", "\033[0m"
+
+ENGLISH = [("ESV", "English Standard Version"), ("NIV", "New International Version"),
+           ("KJV", "King James Version"), ("NKJV", "New King James Version"),
+           ("NRSVUE", "New Revised Standard Version Updated"), ("NASB", "New American Standard Bible"),
+           ("NLT", "New Living Translation"), ("CSB", "Christian Standard Bible"),
+           ("RSV", "Revised Standard Version"), ("MSG", "The Message")]
+KOREAN = [("GAE", "개역개정"), ("HAN", "개역한글"), ("SAE", "표준새번역"), ("SAENEW", "새번역"),
+          ("COG", "공동번역"), ("COGNEW", "공동번역 개정판")]
+
+# English name, Korean name, bskorea code, chapters
+BOOKS = [
+    ("Genesis", "창세기", "gen", 50), ("Exodus", "출애굽기", "exo", 40), ("Leviticus", "레위기", "lev", 27),
+    ("Numbers", "민수기", "num", 36), ("Deuteronomy", "신명기", "deu", 34), ("Joshua", "여호수아", "jos", 24),
+    ("Judges", "사사기", "jdg", 21), ("Ruth", "룻기", "rut", 4), ("1 Samuel", "사무엘상", "1sa", 31),
+    ("2 Samuel", "사무엘하", "2sa", 24), ("1 Kings", "열왕기상", "1ki", 22), ("2 Kings", "열왕기하", "2ki", 25),
+    ("1 Chronicles", "역대상", "1ch", 29), ("2 Chronicles", "역대하", "2ch", 36), ("Ezra", "에스라", "ezr", 10),
+    ("Nehemiah", "느헤미야", "neh", 13), ("Esther", "에스더", "est", 10), ("Job", "욥기", "job", 42),
+    ("Psalms", "시편", "psa", 150), ("Proverbs", "잠언", "pro", 31), ("Ecclesiastes", "전도서", "ecc", 12),
+    ("Song of Songs", "아가", "sng", 8), ("Isaiah", "이사야", "isa", 66), ("Jeremiah", "예레미야", "jer", 52),
+    ("Lamentations", "예레미야애가", "lam", 5), ("Ezekiel", "에스겔", "ezk", 48), ("Daniel", "다니엘", "dan", 12),
+    ("Hosea", "호세아", "hos", 14), ("Joel", "요엘", "jol", 3), ("Amos", "아모스", "amo", 9),
+    ("Obadiah", "오바댜", "oba", 1), ("Jonah", "요나", "jnh", 4), ("Micah", "미가", "mic", 7),
+    ("Nahum", "나훔", "nam", 3), ("Habakkuk", "하박국", "hab", 3), ("Zephaniah", "스바냐", "zep", 3),
+    ("Haggai", "학개", "hag", 2), ("Zechariah", "스가랴", "zec", 14), ("Malachi", "말라기", "mal", 4),
+    ("Matthew", "마태복음", "mat", 28), ("Mark", "마가복음", "mrk", 16), ("Luke", "누가복음", "luk", 24),
+    ("John", "요한복음", "jhn", 21), ("Acts", "사도행전", "act", 28), ("Romans", "로마서", "rom", 16),
+    ("1 Corinthians", "고린도전서", "1co", 16), ("2 Corinthians", "고린도후서", "2co", 13),
+    ("Galatians", "갈라디아서", "gal", 6), ("Ephesians", "에베소서", "eph", 6), ("Philippians", "빌립보서", "php", 4),
+    ("Colossians", "골로새서", "col", 4), ("1 Thessalonians", "데살로니가전서", "1th", 5),
+    ("2 Thessalonians", "데살로니가후서", "2th", 3), ("1 Timothy", "디모데전서", "1ti", 6),
+    ("2 Timothy", "디모데후서", "2ti", 4), ("Titus", "디도서", "tit", 3), ("Philemon", "빌레몬서", "phm", 1),
+    ("Hebrews", "히브리서", "heb", 13), ("James", "야고보서", "jas", 5), ("1 Peter", "베드로전서", "1pe", 5),
+    ("2 Peter", "베드로후서", "2pe", 3), ("1 John", "요한일서", "1jn", 5), ("2 John", "요한이서", "2jn", 1),
+    ("3 John", "요한삼서", "3jn", 1), ("Jude", "유다서", "jud", 1), ("Revelation", "요한계시록", "rev", 22),
+]
+
+
+def say(ko, en):
+    return ko if KO else en
+
+
+def ask(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        sys.exit(0)
+
+
+def korean(ver):
+    return any(v == ver for v, _ in KOREAN)
+
+
+def state():
+    """What was read last: {"ver", "mode": "daily"|"book", "date", "book", "chap"}"""
+    try:
+        return json.load(open(LAST))
+    except (OSError, ValueError):
+        return {}
+
+
+def save_state(st):
+    os.makedirs(CONF, exist_ok=True)
+    json.dump(st, open(LAST, "w"))
+
+
+def last():
+    """This tool's translation (bibt: ESV from 1517.org, like the plan)."""
+    return state().get("ver") or ("ESV" if TOOL == "bibt" else "")
+
+
+def save_ver(ver):
+    pass                                         # kept with the state
+
+
+def book_by(code):
+    return next((b for b in BOOKS if b[2] == code), None)
+
+
+KOF = os.path.join(CONF, "bible-korean")        # there: the Korean ones are listed too
+
+
+def pick_version(english_only=False):
+    """English translations; the Korean ones only once asked for (k)."""
+    old = last()
+    show_ko = not english_only and os.path.exists(KOF)
+    vers = ENGLISH + (KOREAN if show_ko else [])
+    print(say("번역 고르기", "Choose a translation"))
+    for i, (v, name) in enumerate(vers, 1):
+        if i == 1:
+            print(f"  {D}English (Bible Gateway; bibt's ESV from 1517.org){R}")
+        if i == len(ENGLISH) + 1:
+            print(f"  {D}한국어 (대한성서공회){R}")
+        mark = " *" if v == old else ""
+        print(f"  {Y}{i:2d}){R} {C}{v:8}{R} {name}{mark}")
+    if not english_only:
+        print(f"  {Y} k){R} " + (say("한국어 번역 숨기기", "hide the Korean translations") if show_ko
+                                 else say("한국어 번역도 보기 (대한성서공회)", "show Korean translations too")))
+    dflt = old if old in [v for v, _ in vers] else "ESV"
+    a = ask(say(f"번호 (Enter = {dflt}) > ", f"Number (Enter = {dflt}) > "))
+    if not a:
+        return dflt
+    if a.lower() == "k" and not english_only:
+        os.makedirs(CONF, exist_ok=True)
+        if show_ko:
+            os.remove(KOF)
+        else:
+            open(KOF, "w").close()
+        print()
+        return pick_version()
+    if a.isdigit() and 1 <= int(a) <= len(vers):
+        return vers[int(a) - 1][0]
+    for v, name in vers:
+        if a.lower() in (v.lower(), name.lower()):
+            return v
+    print(say("그런 번역이 없습니다.", "No such translation."))
+    return pick_version(english_only)
+
+
+def find_book(text):
+    t = text.lower().replace(" ", "")
+    if t.isdigit() and 1 <= int(t) <= len(BOOKS):
+        return [BOOKS[int(t) - 1]]
+    exact = [b for b in BOOKS if t in (b[0].lower().replace(" ", ""), b[1], b[2])]
+    if exact:
+        return exact
+    return [b for b in BOOKS if b[0].lower().replace(" ", "").startswith(t) or b[1].startswith(text.replace(" ", ""))]
+
+
+def pick_book(ver):
+    ko = korean(ver)
+    rows = [f"{Y}{i:2d}){R} {(b[1] if ko else b[0])}" for i, b in enumerate(BOOKS, 1)]
+    width = max(len(re.sub(r"\033\[[0-9;]*m", "", r)) for r in rows) + 2
+    cols = max(1, min(4, (os.get_terminal_size().columns if sys.stdout.isatty() else 80) // (width + (6 if ko else 0))))
+    per = (len(rows) + cols - 1) // cols
+    for r in range(per):
+        line = ""
+        for c in range(cols):
+            k = c * per + r
+            if k < len(rows):
+                cell = rows[k]
+                plain = re.sub(r"\033\[[0-9;]*m", "", cell)
+                pad = width + (6 if ko else 0) - sum(2 if "가" <= ch <= "힣" else 1 for ch in plain)
+                line += cell + " " * max(1, pad)
+        print(line.rstrip())
+    while True:
+        a = ask(say("책 (번호나 이름, 예: 43, 요한복음, john) > ", "Book (number or name, e.g. 43, john) > "))
+        found = find_book(a) if a else []
+        if len(found) == 1:
+            return found[0]
+        if found:
+            print("  " + ", ".join(b[1] if ko else b[0] for b in found[:10]))
+        else:
+            print(say("그런 책이 없습니다.", "No such book."))
+
+
+def pick_chapter(book, ver):
+    if book[3] == 1:
+        return "1"
+    ko = korean(ver)
+    while True:
+        a = ask(say(f"장 (1-{book[3]}. 여러 장: 1-4, 3-4,6) > ",
+                    f"Chapter (1-{book[3]}; several: 1-4, 3-4,6" + ("; verses: 3:16-21" if not ko else "") + ") > "))
+        t = tidy(a, book)
+        if t and not (ko and ":" in t):
+            if t != re.sub(r"\s+", "", a):
+                print(say(f"  -> {t} ({book[3]}장까지 있습니다)", f"  -> {t} (it has {book[3]} chapters)"))
+            return t
+
+
+def url_for(ver, book, chap):
+    if TOOL == "bibt" and ver == "ESV":           # bibt's ESV: 1517.org, as the plan
+        return "https://www.1517.org/bible?" + urllib.parse.urlencode(
+            {"search": "; ".join(f"{book[0]} {p}" for p in chap.split(",")), "version": "ESV"})
+    if korean(ver):
+        return ("https://www.bskorea.or.kr/bible/korbibReadpage.php?"
+                + urllib.parse.urlencode({"version": ver, "book": book[2], "chap": chap}))
+    return ("https://www.biblegateway.com/passage/?"
+            + urllib.parse.urlencode({"search": f"{book[0]} {chap}", "version": ver}))
+
+
+def check():
+    """Every book's chapter 1 from bskorea: are the book codes right?"""
+    import tempfile
+    bad = []
+    with tempfile.TemporaryDirectory() as d:
+        for b in BOOKS:
+            f = os.path.join(d, b[2] + ".html")
+            r = subprocess.run(["/usr/local/lib/han/web2wg", "--html", url_for("GAE", b, "1"), f],
+                               capture_output=True, text=True)
+            ok = r.returncode == 0 and os.path.exists(f) and re.search(r"<p>\d+ ", open(f).read())
+            print(f"  {b[2]:4} {b[1]:8} {'ok' if ok else 'FAILED'}", flush=True)
+            if not ok:
+                bad.append(b[2])
+    print(say(f"안 되는 책: {' '.join(bad) or '없음'}", f"Failed: {' '.join(bad) or 'none'}"))
+
+
+def chapters(spec, book):
+    """'1-4' / '3-4,6' -> [1, 2, 3, 4] / [3, 4, 6]; a single chapter or a bad spec -> []"""
+    if not re.fullmatch(r"\d+(-\d+)?(,\d+(-\d+)?)+|\d+-\d+", spec or ""):
+        return []
+    out = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        a, b = int(a), min(int(b or a), book[3])     # past the book's end: to its end
+        if not (1 <= a <= b):
+            return []
+        out += [c for c in range(a, b + 1) if c not in out]
+    return out
+
+
+def tidy(spec, book):
+    """The chapters as typed, with ranges past the book's end cut to its end
+    (John 20-30 -> 20-21, John 30 -> 21); None if it makes no sense."""
+    spec = re.sub(r"\s+", "", spec or "")
+    m = re.fullmatch(r"(\d+)(:[\d\-,]+)?", spec)
+    if m:
+        n = int(m.group(1))
+        if n < 1:
+            return None
+        return spec if n <= book[3] else str(book[3])
+    parts = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        if not (a.isdigit() and (not b or b.isdigit())):
+            return None
+        a, b = min(int(a), book[3]), min(int(b or a), book[3])
+        if a > b or a < 1:
+            continue
+        parts.append(str(a) if a == b else f"{a}-{b}")
+    return ",".join(parts) if parts else None
+
+
+def fetch(ver, book, chap):
+    """The chapter's files (.wg for notes, .odt to read); its .odt, or None.
+    Several chapters (1-4, 3-4,6) go into one document."""
+    os.makedirs(DIR, exist_ok=True)
+    name = (f"{book[1]} {chap}장" if korean(ver) else f"{book[0]} {chap}").replace(":", "_")
+    base = os.path.join(DIR, f"{name} ({ver})")
+    many = chapters(chap, book)
+    if (not os.path.exists(base + ".wg") or os.path.getsize(base + ".wg") == 0) and many:
+        print(say(f"{name} ({ver}) 가져오는 중...", f"Getting {name} ({ver})..."))
+        w = web2wg()
+        parts = []
+        try:
+            if korean(ver):                      # bskorea: a page per chapter
+                for c in many:
+                    url = url_for(ver, book, str(c))
+                    parts.append(body(w.clean(w.fetch(url), url)[1]))
+            else:                                # Bible Gateway (or 1517): all at once
+                q = "; ".join(f"{book[0]} {p}" for p in chap.split(","))
+                url = url_for(ver, book, chap) if TOOL == "bibt" and ver == "ESV" else \
+                    "https://www.biblegateway.com/passage/?" + urllib.parse.urlencode({"search": q, "version": ver})
+                parts.append(body(w.clean(w.fetch(url), url)[1]))
+        except Exception as e:
+            print(say("가져오지 못했습니다. 인터넷 연결을 확인하세요.", "Could not get it (online?)."))
+            print("  " + str(e)[-200:])
+            return None
+        page = "<html><head><meta charset='utf-8'></head><body>\n" + "\n".join(parts) + "\n</body></html>"
+        tmp = base + ".tmp.html"
+        open(tmp, "w", encoding="utf-8").write(page)
+        subprocess.run(["/usr/bin/wordgrinder", "--convert", tmp, base + ".wg"], capture_output=True)
+        os.remove(tmp)
+    if not os.path.exists(base + ".wg") or os.path.getsize(base + ".wg") == 0:
+        print(say(f"{name} ({ver}) 가져오는 중...", f"Getting {name} ({ver})..."))
+        r = subprocess.run(["/usr/local/lib/han/web2wg", url_for(ver, book, chap), base + ".wg"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            print(say("가져오지 못했습니다. 인터넷 연결을 확인하세요.", "Could not get it (online?)."))
+            print("  " + r.stderr.strip()[-200:])
+            return None
+    if not os.path.exists(base + ".odt") or os.path.getmtime(base + ".odt") < os.path.getmtime(base + ".wg"):
+        subprocess.run(["/usr/bin/wordgrinder", "--convert", base + ".wg", base + ".odt"],
+                       capture_output=True)
+    return base + ".odt"
+
+
+def step(book, chap, d):
+    """The chapter after (d=1) or before (d=-1), into the next book; after
+    several chapters (3-4,6), from the last (or the first) of them."""
+    many = chapters(chap, book)
+    n = (many[-1] if d > 0 else many[0]) + d if many else int(chap.split(":")[0]) + d
+    k = BOOKS.index(book)
+    if n < 1:
+        if k == 0:
+            return book, "1"
+        book = BOOKS[k - 1]
+        return book, str(book[3])
+    if n > book[3]:
+        return (BOOKS[k + 1], "1") if k + 1 < len(BOOKS) else (book, str(book[3]))
+    return book, str(n)
+
+
+def web2wg():
+    from importlib.machinery import SourceFileLoader
+    return SourceFileLoader("web2wg", WEB2WG).load_module()
+
+
+def plan_refs(day):
+    """The day's readings of the 1517 plan: ["1 Chronicles 22-24", "Luke 3"]"""
+    w = web2wg()
+    ms = int(datetime.datetime(day.year, day.month, day.day,
+                               tzinfo=datetime.timezone.utc).timestamp() * 1000)
+    raw = w.fetch(PLAN.format(ms=ms))
+    refs = re.findall(r'data-date="%s"[^>]*title="([^"]+)"' % day.isoformat(), raw)
+    return [html.unescape(r) for r in dict.fromkeys(refs)]
+
+
+def split_ref(ref):
+    """'1 Chronicles 22-24' -> (book, [22, 23, 24], ''); 'Psalm 119:1-88' -> (book, [119], ':1-88')"""
+    m = re.fullmatch(r"(.+?)\s+(\d+)(?:-(\d+))?(:[\d\-,]+)?", ref.strip())
+    if not m:
+        return None, [], ""
+    name = m.group(1).replace("Psalm", "Psalms").replace("Song of Solomon", "Song of Songs")
+    found = find_book(name)
+    if len(found) != 1:
+        found = [b for b in BOOKS if b[0].lower() == name.lower()] or found[:1]
+    a = int(m.group(2))
+    b = int(m.group(3)) if m.group(3) and not m.group(4) else a
+    return (found[0] if found else None), list(range(a, b + 1)), (m.group(4) or "")
+
+
+def body(page):
+    page = page.split("<body>", 1)[-1].split("</body>", 1)[0]
+    return re.sub(r"<p>https?://[^<]*</p>\s*$", "", page.strip())
+
+
+def daily(ver, day, whole=False):
+    """The day's readings in one document (whole: the whole chapters, not
+    only the verses the plan gives): its .odt, or None."""
+    os.makedirs(DAILY, exist_ok=True)
+    base = os.path.join(DAILY, f"{day.isoformat()} ({ver})" + (say(" 장 전체", " whole") if whole else ""))
+    if not os.path.exists(base + ".wg") or os.path.getsize(base + ".wg") == 0:
+        print(say(f"{day.isoformat()} 읽을 말씀 가져오는 중...", f"Getting the readings for {day.isoformat()}..."))
+        w = web2wg()
+        try:
+            refs = plan_refs(day)
+        except Exception as e:
+            print(say(f"일년 일독표를 가져오지 못했습니다: {e}", f"Could not get the reading plan: {e}"))
+            return None
+        if not refs:
+            print(say("그날 읽을 말씀이 표에 없습니다.", "The plan has no readings for that day."))
+            return None
+        json.dump(refs, open(os.path.join(DAILY, day.isoformat() + ".refs"), "w"))
+        def shown(ref):
+            book, chaps, _ = split_ref(ref)
+            if not (korean(ver) and book):
+                return ref
+            return f"{book[1]} {chaps[0]}" + (f"-{chaps[-1]}" if len(chaps) > 1 else "") + "장"
+        parts = [f"<h1>{day.isoformat()} ({ver})</h1>",
+                 "<p>" + html.escape("  /  ".join(shown(r) for r in refs)) + "</p>"]
+        for n, ref in enumerate(refs):
+            book, chaps, verses = split_ref(ref)
+            label = (say("구약", "Old Testament") if n == 0 else say("신약", "New Testament")) \
+                if len(refs) == 2 else ""
+            if book is None:
+                parts.append(f"<h1>{html.escape(ref)}</h1><p>?</p>")
+                continue
+            name = shown(ref)
+            parts.append(f"<h1>{html.escape((label + ': ' if label else '') + name)}</h1>")
+            try:
+                if korean(ver):                  # bskorea: one page per chapter
+                    for c in chaps:
+                        url = url_for(ver, book, str(c))
+                        parts.append(re.sub(r"<(/?)h1>", r"<\1h2>", body(w.clean(w.fetch(url), url)[1])))
+                else:                            # Bible Gateway or 1517: the whole reference at once
+                    q = f"{book[0]} {chaps[0]}" + (f"-{chaps[-1]}" if len(chaps) > 1 else "") if whole else ref
+                    url = ("https://www.1517.org/bible?" + urllib.parse.urlencode({"search": q, "version": "ESV"})
+                           if ver == "ESV" else "https://www.biblegateway.com/passage/?"
+                           + urllib.parse.urlencode({"search": q, "version": ver}))
+                    parts.append(re.sub(r"<(/?)h1>", r"<\1h2>", body(w.clean(w.fetch(url), url)[1])))
+            except Exception as e:
+                parts.append(f"<p>{html.escape(say('가져오지 못함: ', 'not got: ') + str(e))}</p>")
+        page = "<html><head><meta charset='utf-8'></head><body>\n" + "\n".join(parts) + "\n</body></html>"
+        tmp = base + ".tmp.html"
+        open(tmp, "w", encoding="utf-8").write(page)
+        subprocess.run(["/usr/bin/wordgrinder", "--convert", tmp, base + ".wg"], capture_output=True)
+        os.remove(tmp)
+        if not os.path.exists(base + ".wg"):
+            return None
+    if not os.path.exists(base + ".odt") or os.path.getmtime(base + ".odt") < os.path.getmtime(base + ".wg"):
+        subprocess.run(["/usr/bin/wordgrinder", "--convert", base + ".wg", base + ".odt"],
+                       capture_output=True)
+    return base + ".odt"
+
+
+def day_books(date):
+    """The books of that day's readings (for c in bibt)."""
+    try:
+        refs = json.load(open(os.path.join(DAILY, date + ".refs")))
+    except (OSError, ValueError):
+        try:
+            refs = plan_refs(datetime.date.fromisoformat(date))
+        except Exception:
+            refs = []
+    books = []
+    for r in refs:
+        b = split_ref(r)[0]
+        if b and b not in books:
+            books.append(b)
+    return books
+
+
+def pick_in_day(date, ver):
+    """bibt c: chapters of your choice, in the books of the day's readings."""
+    books = day_books(date)
+    if not books:
+        return None
+    ko = korean(ver)
+    book = books[0]
+    if len(books) > 1:
+        for i, b in enumerate(books, 1):
+            print(f"  {Y}{i}){R} {b[1] if ko else b[0]}")
+        a = ask(say("책 (Enter = 1) > ", "Book (Enter = 1) > "))
+        if a.isdigit() and 1 <= int(a) <= len(books):
+            book = books[int(a) - 1]
+    print(f"{book[1] if ko else book[0]}")
+    return {"book": book[2], "chap": pick_chapter(book, ver)}
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] in (["-h"], ["--help"]):
+        print("".join(l[2:] for l in open(__file__, encoding="utf-8").readlines()[1:15]), end="")
+        return
+    if a[:1] == ["--check"]:
+        return check()
+    st = state()
+    ver = last()
+    today = datetime.date.today().isoformat()
+    if a[:1] == ["-c"] or not ver:
+        ver = pick_version(english_only=TOOL == "bibt")
+        if TOOL == "bibr":
+            book = pick_book(ver)
+            st.update(book=book[2], chap=pick_chapter(book, ver))
+    if TOOL == "bibt":
+        if a and re.fullmatch(r"\d{4}-\d\d-\d\d", a[0]):
+            st.update(date=a[0], pick=None)
+        elif st.get("date") != today:          # a new day: its readings, verses as given
+            st.update(date=today, whole=False, pick=None)
+    elif a and a[0] != "-c":                   # bibr john 3 / bibr 요한복음 3:16
+        m = re.fullmatch(r"(.+?)\s*(\d+(?:\s*[-,]\s*\d+)*(:[\d\-,]+)?)?", " ".join(a))
+        found = find_book(m.group(1)) if m else []
+        if len(found) != 1:
+            print(say("책 이름을 모르겠습니다: ", "Unknown book: ") + " ".join(a))
+            return
+        chap = tidy(m.group(2) or "1", found[0]) or "1"
+        st.update(book=found[0][2], chap=chap.split(":")[0] if korean(ver) else chap)
+    elif not book_by(st.get("book", "")):      # first time: which book
+        book = pick_book(ver)
+        st.update(book=book[2], chap=pick_chapter(book, ver))
+    while True:                                # read; < > a c come back here
+        st["ver"] = ver
+        save_state(st)
+        pick = st.get("pick") if TOOL == "bibt" else None
+        if pick and book_by(pick.get("book", "")):
+            f = fetch(ver, book_by(pick["book"]), pick["chap"])
+        elif TOOL == "bibt":
+            f = daily(ver, datetime.date.fromisoformat(st["date"]), st.get("whole", False))
+        else:
+            f = fetch(ver, book_by(st["book"]), st["chap"])
+        if f is None:
+            return
+        env = dict(os.environ, HAN_HB_BIBR=TOOL + ("-pick" if pick else ""))
+        r = subprocess.run(["hb", f], env=env).returncode
+        if r in (11, 12) and pick:              # bibt, chosen chapters: within that book
+            book = book_by(pick["book"])
+            nb, chap = step(book, pick["chap"], 1 if r == 11 else -1)
+            if nb is book:
+                pick["chap"] = chap
+        elif r == 15 and TOOL == "bibt":         # d: back to the day's readings
+            st["pick"] = None
+        elif r == 14 and TOOL == "bibt":         # v: another translation
+            print("\033[2J\033[H", end="")
+            ver = pick_version(english_only=True)
+        elif r == 10 and TOOL == "bibt":         # c: chapters in the day's books
+            print("\033[2J\033[H", end="")
+            st["pick"] = pick_in_day(st["date"], ver) or st.get("pick")
+        elif r in (11, 12):
+            d = 1 if r == 11 else -1
+            if TOOL == "bibt":
+                st["date"] = (datetime.date.fromisoformat(st["date"]) + datetime.timedelta(days=d)).isoformat()
+            else:
+                book, chap = step(book_by(st["book"]), st["chap"], d)
+                st.update(book=book[2], chap=chap)
+        elif r == 13 and TOOL == "bibt" and not pick:
+            st["whole"] = not st.get("whole", False)
+        elif r == 10:
+            print("\033[2J\033[H", end="")
+            ver = pick_version(english_only=TOOL == "bibt")
+            if TOOL == "bibr":
+                book = pick_book(ver)
+                st.update(book=book[2], chap=pick_chapter(book, ver))
+        else:
+            return
+
+
+if __name__ == "__main__":
+    main()

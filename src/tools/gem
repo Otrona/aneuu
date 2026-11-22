@@ -1,0 +1,594 @@
+#!/usr/bin/env python3
+# gem: chat with an AI on the console: Groq (fast, free key) or Google Gemini.
+# In the desktop Alt+G opens it in a panel on the right (like F12); close it
+# and you are back in your work.
+#   gem            chat (the conversation is kept until /new)
+#   gem -k         set a key: Groq (https://console.groq.com/keys, tried first)
+#                  or Gemini (https://aistudio.google.com/apikey, the fallback)
+# In the chat: /copy  last answer to the paste buffer (F7 pastes it, e.g. in
+# WordGrinder)   /new  new conversation   q or Ctrl+D  close
+# Desktop: Alt+G opens and closes it beside your work, Alt+O moves between
+# the two sides, F6 copies any text on the screen, F7 pastes it.
+#   /pdf NAME [PAGE]  send that page (or a picture) with your next question;
+#   NAME is part of the file name or a pattern (regular expression), e.g.
+#   /pdf 계약 3   /pdf report.*2026 1   /pdf scan   (its text goes along;
+#   a scanned page is read with OCR if installed, else sent as a picture)
+import base64, json, os, re, subprocess, sys, time, textwrap, unicodedata, urllib.error, urllib.request
+try:
+    import readline  # noqa: F401  (line editing, history)
+except ImportError:
+    pass
+
+KO = bool(os.environ.get("HAN_ACTIVE"))
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "han")
+KEYF = os.path.join(CONF, "gemini-key")
+GKEYF = os.path.join(CONF, "groq-key")
+HIST = os.path.join(CONF, "gemini-chat.json")
+LASTM = os.path.join(CONF, "gemini-model")
+API = os.environ.get("GEMINI_API_BASE", "https://generativelanguage.googleapis.com/v1beta")
+GROQ = os.environ.get("GROQ_API_BASE", "https://api.groq.com/openai/v1")
+SYSTEM = ("Answer in the language of the question. The answer is shown on a small text "
+          "console: keep it short and plain, no tables, no emoji, little markdown.")
+B, D, R = "\033[1;36m", "\033[2m", "\033[0m"
+
+
+def say(ko, en):
+    return ko if KO else en
+
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else
+               0 if unicodedata.combining(c) else 1 for c in s)
+
+
+def page_out(lines, w):
+    """Print an answer a screenful at a time: Space the next part, Enter one
+    more line, q the rest skipped (it stays whole for /copy)."""
+    import shutil, termios, tty
+    rows = shutil.get_terminal_size().lines - 2
+    if not sys.stdin.isatty() or rows < 4:
+        print("\n".join(lines))
+        return
+    used, total = 0, len(lines)
+    for i, line in enumerate(lines):
+        need = max(1, -(-width(line) // max(1, w + 1)))   # rows this line takes
+        if used + need > rows:
+            msg = say(f"-- 계속: Space 다음, Enter 한 줄, q 그만 ({i}/{total}) --",
+                      f"-- more: Space next, Enter one line, q stop ({i}/{total}) --")
+            print(f"{D}{msg}{R}", end="", flush=True)
+            fd = sys.stdin.fileno()
+            old = termios.tcgetattr(fd)
+            try:
+                tty.setcbreak(fd)
+                k = sys.stdin.read(1)
+            finally:
+                termios.tcsetattr(fd, termios.TCSADRAIN, old)
+            print("\r\033[K", end="")
+            if k in ("q", "Q", "\x1b"):
+                print(D + say("(나머지는 건너뜀. /copy 는 답 전체)", "(rest skipped; /copy takes it all)") + R)
+                return
+            used = rows - 1 if k in ("\n", "\r") else 0
+        print(line)
+        used += need
+
+
+def wrap(text, w):
+    """Wrap to the panel, counting Korean as two columns. Inside the desktop
+    tmux wraps the lines itself, so a sentence copied with F6 comes out whole."""
+    if os.environ.get("TMUX"):
+        return text.split("\n")
+    out = []
+    for para in text.split("\n"):
+        line, cw = "", 0
+        for word in re.split(r"(\s+)", para):
+            n = width(word)
+            if cw + n > w and line.strip():
+                out.append(line.rstrip())
+                line, cw = "", 0
+                if word.isspace():
+                    continue
+            while n > w:                 # a very long word: cut it
+                cut, k = "", 0
+                for ch in word:
+                    if k + width(ch) > w:
+                        break
+                    cut += ch
+                    k += width(ch)
+                out.append(cut)
+                word = word[len(cut):]
+                n = width(word)
+            line += word
+            cw += n
+        out.append(line.rstrip())
+    return out
+
+
+FOLD = {
+    "\u00b7": "-", "\u2022": "*", "\u25aa": "*", "\u25a0": "*", "\u25cf": "*",
+    "\u25cb": "o", "\u25e6": "o", "\u203b": "*", "\u2219": "-", "\u30fb": "-",
+    "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'", "\u2026": "...",
+    "\u2013": "-", "\u2014": "--", "\u2015": "--", "\u2192": "->", "\u2190": "<-",
+    "\u2191": "^", "\u2193": "v", "\u00d7": "x", "\u00b0": " deg",
+    "\u2500": "-", "\u2501": "-", "\u2502": "|", "\u2503": "|",
+    "\u250c": "+", "\u2510": "+", "\u2514": "+", "\u2518": "+",
+    "\u251c": "+", "\u2524": "+", "\u252c": "+", "\u2534": "+", "\u253c": "+",
+    "\u00a0": " ", "\u25a1": "[ ]", "\u2610": "[ ]", "\u2611": "[x]",
+}
+
+
+def console_safe(c):
+    """True for characters fbterm draws as wide as the terminal counts them:
+    plain letters and signs, Hangul, CJK. Emoji and other newer wide signs are
+    counted differently and push the rest of the line out of its place."""
+    o = ord(c)
+    if o < 0x300 or 0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F:
+        return True
+    if o > 0xFFFF or c in "\u200d\ufe0e\ufe0f":
+        return False
+    if unicodedata.east_asian_width(c) in "WF":
+        return 0x2E80 <= o <= 0xA4CF or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F or 0xFF00 <= o <= 0xFFE6
+    return True
+
+
+def plain(md):
+    """Markdown to plain console text, with only characters the console
+    draws in their place (no emoji; curly quotes and bullets as ASCII)."""
+    md = "".join(FOLD.get(c, c) for c in md if c in FOLD or c == "\n" or console_safe(c))
+    md = re.sub(r"```\w*\n?", "", md)
+    md = re.sub(r"\*\*(.+?)\*\*", r"\1", md)
+    md = re.sub(r"(?m)^#+\s*", "", md)
+    md = re.sub(r"(?m)^(\s*)[*-]\s+", r"\1- ", md)
+    md = re.sub(r"`([^`]+)`", r"\1", md)
+    return md.strip()
+
+
+def read_key(env, path):
+    k = os.environ.get(env, "")
+    if not k:
+        try:
+            k = open(path).read().strip()
+        except OSError:
+            pass
+    return k
+
+
+def keys():
+    """[(provider, key)], Groq first (fast); Gemini as the fallback."""
+    out = []
+    for name, env, path in (("groq", "GROQ_API_KEY", GKEYF), ("gemini", "GEMINI_API_KEY", KEYF)):
+        k = read_key(env, path)
+        if k:
+            out.append((name, k))
+    return out
+
+
+def set_key():
+    print(say("무료 API 키가 하나 필요합니다. 다른 컴퓨터나 휴대폰에서 만드세요:",
+              "You need a free API key. Make one on another computer or a phone:"))
+    print("  1) Groq   https://console.groq.com/keys   " + say("(빠름, 먼저 씀)", "(fast, used first)"))
+    print("  2) Gemini https://aistudio.google.com/apikey   " + say("(Groq 가 안 될 때)", "(when Groq fails)"))
+    print(say("키를 파일로 가져왔다면:  cp 파일 ~/.config/han/groq-key  (또는 gemini-key)",
+              "If you brought the key as a file:  cp FILE ~/.config/han/groq-key  (or gemini-key)"))
+    k = input(say("키 입력 (Enter 취소) > ", "Key (Enter cancels) > ")).strip()
+    if not k:
+        return ""
+    path = GKEYF if k.startswith("gsk_") else KEYF if k.startswith("AIza") else None
+    if path is None:
+        a = input(say("어느 키입니까? 1 Groq, 2 Gemini > ", "Which key is it? 1 Groq, 2 Gemini > ")).strip()
+        path = GKEYF if a == "1" else KEYF
+    os.makedirs(CONF, exist_ok=True)
+    with open(path, "w") as f:
+        f.write(k + "\n")
+    os.chmod(path, 0o600)
+    print(say("저장했습니다.", "Saved."))
+    return k
+
+
+def call(path, k, body=None, timeout=45):
+    url = f"{API}/{path}{'&' if '?' in path else '?'}key={k}"
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def models(k):
+    """Models to try, best first: the newest plain "flash", then older flash,
+    then the lighter flash-lite ones (when one is busy, the next may not be).
+    GEMINI_MODEL puts that one first."""
+    try:
+        names = [m["name"].split("/", 1)[1] for m in call("models?pageSize=200", k, timeout=10).get("models", [])
+                 if "generateContent" in m.get("supportedGenerationMethods", [])]
+    except Exception:
+        names = []
+    def ver(n):
+        return [int(x) for x in re.findall(r"\d+", n)]
+    flash = sorted((n for n in names if re.fullmatch(r"gemini-[\d.]+-flash", n)), key=ver, reverse=True)
+    lite = sorted((n for n in names if re.fullmatch(r"gemini-[\d.]+-flash-lite", n)), key=ver, reverse=True)
+    order = (flash[:3] + lite[:2]) or ["gemini-2.5-flash", "gemini-2.5-flash-lite"]
+    if os.environ.get("GEMINI_MODEL"):
+        order.insert(0, os.environ["GEMINI_MODEL"])
+    return order
+
+
+GROQ_PREF = [r"moonshotai/kimi-k2", r"openai/gpt-oss-120b", r"llama-3\.3-70b",
+             r"meta-llama/llama-4-maverick", r"qwen/qwen3", r"openai/gpt-oss-20b",
+             r"meta-llama/llama-4-scout", r"llama-3\.1-8b"]
+GROQ_VISION = r"llama-4-(scout|maverick)|vision"
+
+
+def groq_call(path, k, body=None, timeout=45):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(f"{GROQ}/{path}", data=data, headers={
+        "Content-Type": "application/json", "Authorization": "Bearer " + k,
+        "User-Agent": "gem/2 (Aneuu)"})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def groq_models(k):
+    """Groq's chat models, best for Korean and general use first."""
+    try:
+        names = [m["id"] for m in groq_call("models", k, timeout=10).get("data", [])
+                 if m.get("active", True)]
+    except Exception:
+        names = []
+    names = [n for n in names if not re.search(r"whisper|tts|guard|playai|orpheus|compound", n)]
+    order = []
+    for pat in GROQ_PREF:
+        order += sorted((n for n in names if re.search(pat, n) and n not in order), reverse=True)[:1]
+    order += [n for n in names if n not in order][:2]
+    return order or ["openai/gpt-oss-120b", "llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+
+
+def to_openai(contents):
+    msgs = [{"role": "system", "content": SYSTEM}]
+    for t in contents:
+        role = "assistant" if t["role"] == "model" else "user"
+        if any("inline_data" in p for p in t["parts"]):
+            c = []
+            for p in t["parts"]:
+                if "text" in p:
+                    c.append({"type": "text", "text": p["text"]})
+                else:
+                    d = p["inline_data"]
+                    c.append({"type": "image_url", "image_url": {
+                        "url": f"data:{d['mime_type']};base64,{d['data']}"}})
+        else:
+            c = "\n".join(p.get("text", "") for p in t["parts"])
+        msgs.append({"role": role, "content": c})
+    return msgs
+
+
+def ask_one(prov, m, k, contents):
+    if prov == "groq":
+        r = groq_call("chat/completions", k, {"model": m, "messages": to_openai(contents)})
+        ans = r["choices"][0]["message"].get("content") or ""
+        return re.sub(r"(?s)<think>.*?</think>\s*", "", ans)
+    r = call(f"models/{m}:generateContent", k, {
+        "contents": contents, "systemInstruction": {"parts": [{"text": SYSTEM}]}})
+    return "".join(p.get("text", "") for p in r["candidates"][0]["content"]["parts"])
+
+
+def ask_gemini(order, k, contents, note):
+    """Ask; when a model is busy (503) or out of its free share (429), wait a
+    moment and try the next one. Gives up after about two minutes.
+    Returns (answer, model used)."""
+    last, start = None, time.time()
+    picture = any("inline_data" in p for p in contents[-1]["parts"])
+    for i, (prov, m, k) in enumerate(order):
+        if picture and prov == "groq" and not re.search(GROQ_VISION, m):
+            continue                          # this one cannot see pictures
+        for attempt in range(2 if i == 0 and prov == "gemini" else 1):
+            if time.time() - start > 120:
+                break
+            try:
+                return ask_one(prov, m, k, contents), (prov, m, k)
+            except urllib.error.HTTPError as e:
+                last = e
+                if e.code == 400 and picture:
+                    continue
+                if e.code in (401, 403) and len({o[0] for o in order}) > 1:
+                    note[0] = say(f"{prov} 키 문제, 다른 곳으로", f"{prov} key problem, trying the other")
+                    continue
+                if e.code not in (413, 429, 500, 502, 503, 504):
+                    raise
+                note[0] = say(f"{m} 바쁨, 다른 모델로", f"{m} busy, trying another")
+                time.sleep(2)
+            except OSError as e:              # timeout, connection reset
+                last = e
+                note[0] = say(f"{m} 응답 없음, 다른 모델로", f"{m} not answering, trying another")
+    if last is None and picture:
+        raise LookupError("picture")
+    raise last if last else TimeoutError("no answer")
+
+
+def ask_waiting(order, k, contents):
+    """ask_gemini in the background; meanwhile show the seconds. Ctrl+C
+    gives up on this question (the chat stays open)."""
+    import threading
+    box, note = {}, [""]
+    def work():
+        try:
+            box["ok"] = ask_gemini(order, k, contents, note)
+        except BaseException as e:            # noqa: B902 (hand it over)
+            box["err"] = e
+    t = threading.Thread(target=work, daemon=True)
+    t.start()
+    t0 = time.time()
+    try:
+        while t.is_alive():
+            t.join(0.5)
+            msg = say(f"생각 중... {int(time.time() - t0)}초  (Ctrl+C 취소)",
+                      f"Thinking... {int(time.time() - t0)} s  (Ctrl+C cancels)")
+            print(f"\r{D}{msg}  {note[0]}{R}\033[K", end="", flush=True)
+    except KeyboardInterrupt:
+        print("\r\033[K" + say("취소했습니다.", "Cancelled."))
+        raise
+    print("\r\033[K", end="")
+    if "err" in box:
+        raise box["err"]
+    return box["ok"]
+
+
+KINDS = {".pdf": "application/pdf", ".png": "image/png", ".jpg": "image/jpeg",
+         ".jpeg": "image/jpeg", ".webp": "image/webp"}
+
+
+def find_files(pattern):
+    """Files whose name matches (regular expression, or plain text if that is
+    not a valid expression), here, in the home folder and on USB sticks."""
+    try:
+        rx = re.compile(pattern, re.I)
+        match = lambda n: rx.search(n)
+    except re.error:
+        match = lambda n: pattern.lower() in n.lower()
+    roots = [(os.getcwd(), 2), (os.path.expanduser("~"), 4), ("/media", 4), ("/mnt", 3)]
+    seen, out = set(), []
+    for root, depth in roots:
+        base = root.rstrip("/").count("/")
+        for d, dirs, files in os.walk(root):
+            if d.count("/") - base >= depth:
+                dirs[:] = []
+            dirs[:] = [x for x in dirs if not x.startswith(".")]
+            for f in files:
+                path = os.path.join(d, f)
+                if os.path.splitext(f)[1].lower() in KINDS and match(f) and path not in seen:
+                    seen.add(path)
+                    out.append(path)
+    return sorted(out, key=lambda p: (len(p), p))[:20]
+
+
+def ocr(img_args):
+    """Text from a picture with tesseract (had ocr), or ""."""
+    try:
+        langs = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True).stdout.split()
+    except OSError:
+        return ""
+    lang = "+".join(l for l in ("kor", "eng") if l in langs) or "eng"
+    return subprocess.run(["tesseract", *img_args, "-", "-l", lang],
+                          capture_output=True, text=True).stdout.strip()
+
+
+def page_part(path, page):
+    """The page's text (a scanned page: OCR if installed, else the page as a
+    picture); a picture file: OCR text, else the picture."""
+    ext = os.path.splitext(path)[1].lower()
+    label = f"[{os.path.basename(path)}" + (f", page {page}]" if ext == ".pdf" else "]")
+    if ext == ".pdf":
+        text = subprocess.run(["pdftotext", "-f", str(page), "-l", str(page), "-layout", path, "-"],
+                              capture_output=True, text=True).stdout.strip()
+        if len(text) > 40:
+            return {"text": f"{label}\n{text}"}
+        print(say("글자가 없는 쪽 (스캔): 그림으로 읽는 중...", "No text on this page (scan): reading the picture..."))
+        png = subprocess.run(["pdftoppm", "-r", "200", "-gray", "-png", "-f", str(page), "-l", str(page),
+                              "-singlefile", path], capture_output=True).stdout
+        if png:
+            import tempfile
+            with tempfile.NamedTemporaryFile(suffix=".png") as f:
+                f.write(png)
+                f.flush()
+                text = ocr([f.name])
+            if len(text) > 20:
+                return {"text": f"{label} (OCR)\n{text}"}
+        jpg = subprocess.run(["pdftoppm", "-r", "120", "-jpeg", "-jpegopt", "quality=80",
+                              "-f", str(page), "-l", str(page), "-singlefile", path],
+                             capture_output=True).stdout
+        if not jpg:
+            return None
+        return {"inline_data": {"mime_type": "image/jpeg", "data": base64.b64encode(jpg).decode()}}
+    text = ocr([path])
+    if len(text) > 20:
+        return {"text": f"{label} (OCR)\n{text}"}
+    data = open(path, "rb").read()
+    return {"inline_data": {"mime_type": KINDS[ext], "data": base64.b64encode(data).decode()}}
+
+
+def attach(arg):
+    """/pdf NAME [PAGE]: the part to send with the next question, or None."""
+    words = arg.split()
+    page = 1
+    if len(words) > 1 and words[-1].isdigit():
+        page = int(words.pop())
+    if not words:
+        print(say("쓰는 법: /pdf 파일이름(일부) [쪽]   예: /pdf 계약 3",
+                  "Usage: /pdf NAME [PAGE]   e.g. /pdf contract 3"))
+        return None
+    files = find_files(" ".join(words))
+    if not files:
+        print(say("그런 이름의 PDF 나 그림이 없습니다.", "No PDF or picture with that name."))
+        return None
+    path = files[0]
+    if len(files) > 1:
+        for i, f in enumerate(files, 1):
+            print(f"{B}{i:3d}){R} {f.replace(os.path.expanduser('~'), '~', 1)}")
+        a = input(say("번호 > ", "Number > ")).strip()
+        if not (a.isdigit() and 1 <= int(a) <= len(files)):
+            return None
+        path = files[int(a) - 1]
+    part = page_part(path, page)
+    if part is None:
+        print(say(f"{page}쪽을 읽지 못했습니다 (쪽 수를 넘었나요?)", f"Cannot read page {page} (past the end?)"))
+        return None
+    name = os.path.basename(path) + (f" {page}" + say("쪽", "") if path.lower().endswith(".pdf") else "")
+    print(say(f"붙였습니다: {name}. 이제 물어보세요 (예: 이 쪽을 요약해 줘).",
+              f"Attached: {name}. Now ask (e.g. summarize this page)."))
+    return part, name
+
+
+def show_help():
+    """The key summary (the same one F12 shows): in the F12 panel in the
+    desktop, printed here otherwise."""
+    if os.environ.get("TMUX"):
+        subprocess.run(["tmux", "display-popup", "-E", "-x", "R", "-y", "0", "-w", "34%",
+                        "-h", "100%", "-b", "rounded", "han-cheat gem"])
+        return
+    lang = "ko" if KO else "en"
+    for f in (f"/usr/share/han/cheat/{lang}/gem.txt", "/usr/share/han/cheat/en/gem.txt"):
+        try:
+            print(open(f, encoding="utf-8").read())
+            return
+        except OSError:
+            pass
+
+
+def tmux_copy(text):
+    os.system("tmux set-buffer -- " + "'" + text.replace("'", "'\\''") + "' 2>/dev/null")
+
+
+def main():
+    if sys.argv[1:2] in (["-h"], ["--help"]):
+        print("".join(l[2:] for l in open(__file__, encoding="utf-8").readlines()[1:15]), end="")
+        return
+    if sys.argv[1:2] == ["-k"] or not keys():
+        try:
+            if not set_key():
+                return
+        except (EOFError, KeyboardInterrupt):
+            return
+    k = None
+    try:
+        hist = json.load(open(HIST, encoding="utf-8"))
+    except (OSError, ValueError):
+        hist = []
+    import shutil
+    w = max(20, shutil.get_terminal_size().columns - 1)
+    order = []
+    for prov, pk in keys():
+        order += [(prov, x, pk) for x in (groq_models(pk) if prov == "groq" else models(pk))]
+    try:                                  # the one that answered last time first
+        good = open(LASTM).read().strip()
+        order.sort(key=lambda o: f"{o[0]}:{o[1]}" != good)
+    except OSError:
+        pass
+    m = order[0]
+    print(D + say("F12 쓰는 법", "F12 how to") + R)
+    for turn in hist[-4:]:                       # where you left off
+        who = B + say("나", "me") + R if turn["role"] == "user" else B + "AI" + R
+        print(who)
+        print("\n".join(wrap(plain(turn["parts"][-1].get("text", "")), w)))
+    last = next((t["parts"][0]["text"] for t in reversed(hist) if t["role"] == "model"), "")
+    pending = None
+    while True:
+        try:
+            q = input(f"\n\001{B}\002> \001{R}\002").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if q in ("q", "/q", "/quit", "exit"):
+            return
+        if not q:
+            continue
+        if q in ("/help", "/h", "?", "/?", "/도움"):
+            show_help()
+            continue
+        if q == "/new":
+            hist, last = [], ""
+            try:
+                os.remove(HIST)
+            except OSError:
+                pass
+            print(say("새 대화.", "New conversation."))
+            continue
+        if q.startswith("/pdf") or q.startswith("/img"):
+            try:
+                got = attach(q[4:].strip())
+            except (EOFError, KeyboardInterrupt):
+                got = None
+            if got:
+                pending = got
+            continue
+        if q == "/copy":
+            tmux_copy(plain(last))
+            print(say("복사했습니다. 쓰던 곳에서 F7 로 붙여 넣으세요.",
+                      "Copied. Paste it with F7 where you write."))
+            continue
+        parts = [{"text": q}]
+        if pending:
+            parts.insert(0, pending[0])
+        hist.append({"role": "user", "parts": parts})
+        try:
+            # only the newest page goes along again (smaller, faster requests)
+            newest = max((i for i, t in enumerate(hist) if any("inline_data" in p for p in t["parts"])),
+                         default=-1)
+            send = [t if i == newest else {"role": t["role"],
+                    "parts": [p for p in t["parts"] if "text" in p] or [{"text": "[page]"}]}
+                    for i, t in enumerate(hist)]
+            ans, used = ask_waiting(order, k, send[-40:])
+            if used != m and not any("inline_data" in p for p in parts):  # a picture-only switch stays one-off
+                # it answers from now on, and first next time too
+                print(D + say(f"(답한 모델: {used[1]}, 이제부터 이 모델로)", f"(answered by {used[1]}; using it from now on)") + R)
+                order = [used] + [x for x in order if x != used]
+                m = used
+                try:
+                    os.makedirs(CONF, exist_ok=True)
+                    open(LASTM, "w").write(f"{used[0]}:{used[1]}\n")
+                except OSError:
+                    pass
+        except urllib.error.HTTPError as e:
+            hist.pop()
+            msg = e.read().decode("utf-8", "replace")
+            if e.code in (400, 401, 403) and "key" in msg.lower():
+                print(say("API 키가 맞지 않습니다. 다시 넣으려면: gem -k", "The API key is not valid. Set it again: gem -k"))
+            elif e.code == 400 and pending:
+                print(say("이 쪽(그림)을 읽을 수 있는 모델이 없습니다. had ocr 을 한 번 하면 글자로 보냅니다.",
+                          "No model here can read this page (picture). After had ocr it goes as text."))
+            elif e.code in (429, 500, 503, 504):
+                print(say("지금은 모두 바쁘거나 무료 한도를 넘었습니다. 조금 뒤에 같은 질문을 다시 하세요 (위 화살표).",
+                          "All busy, or the free limit is reached. Ask again in a while (Up arrow)."))
+            else:
+                print(f"{e.code} {msg[:200]}")
+            continue
+        except KeyboardInterrupt:
+            hist.pop()
+            continue
+        except LookupError:
+            hist.pop()
+            print(say("이 쪽(그림)을 읽을 수 있는 모델이 없습니다. had ocr 을 한 번 하면 글자로 보냅니다.",
+                      "No model here can read this page (picture). After had ocr it goes as text."))
+            continue
+        except Exception as e:
+            hist.pop()
+            print(say(f"닿지 못했습니다 (인터넷 연결?): {e}", f"Cannot reach it (online?): {e}"))
+            continue
+        hist.append({"role": "model", "parts": [{"text": ans}]})
+        last = ans
+        if pending:                           # keep the page for follow-ups in
+            pending = None                    # this session, not on disk
+        print(B + "AI" + R)
+        page_out(wrap(plain(ans), w), w)
+        try:
+            os.makedirs(CONF, exist_ok=True)
+            light = [{"role": t["role"], "parts": [p if "text" in p else {"text": "[page]"}
+                                                    for p in t["parts"]]} for t in hist[-40:]]
+            json.dump(light, open(HIST, "w", encoding="utf-8"), ensure_ascii=False)
+        except OSError:
+            pass
+
+
+if __name__ == "__main__":
+    try:
+        open("/proc/self/comm", "w").write("gem")
+    except OSError:
+        pass
+    main()

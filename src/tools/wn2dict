@@ -1,0 +1,106 @@
+#!/usr/bin/env python3
+# wn2dict WORDNET_DIR OUT_DIR: Princeton WordNet 3.0 (its data.* and index.*
+# files) as a StarDict dictionary for sdcv: OUT_DIR/wordnet.{ifo,idx,syn,dict}.
+# Inflected forms from the *.exc lists (went, mice, better) lead to their word.
+import os, re, struct, sys
+
+POS = [("noun", "n"), ("verb", "v"), ("adj", "a"), ("adv", "r")]
+NAMES = {"n": "noun", "v": "verb", "a": "adj", "r": "adv"}
+
+
+def synsets(path):
+    """offset -> (words, gloss)"""
+    out = {}
+    for line in open(path, encoding="utf-8", errors="replace"):
+        if line.startswith("  "):
+            continue
+        head, _, gloss = line.partition(" | ")
+        f = head.split()
+        n = int(f[3], 16)
+        words = [re.sub(r"\(.*\)$", "", f[4 + 2 * i]).replace("_", " ") for i in range(n)]
+        out[f[0]] = (words, gloss.strip())
+    return out
+
+
+def dictzip(data, chunk=58315):
+    """gzip with the dictzip "RA" field: chunks that unpack one by one."""
+    import zlib
+    z = zlib.compressobj(9, zlib.DEFLATED, -15)
+    sizes, body = [], bytearray()
+    for i in range(0, len(data), chunk):
+        part = z.compress(data[i:i + chunk]) + z.flush(zlib.Z_FULL_FLUSH)
+        sizes.append(len(part))
+        body += part
+    body += z.flush(zlib.Z_FINISH)
+    ra = struct.pack("<HHH", 1, chunk, len(sizes)) + b"".join(struct.pack("<H", n) for n in sizes)
+    extra = b"RA" + struct.pack("<H", len(ra)) + ra
+    head = b"\x1f\x8b\x08\x04" + struct.pack("<I", 0) + b"\x02\x03" + struct.pack("<H", len(extra)) + extra
+    tail = struct.pack("<II", zlib.crc32(data) & 0xffffffff, len(data) & 0xffffffff)
+    return head + bytes(body) + tail
+
+
+def main(src, dst):
+    entries = {}                                   # word -> {pos: [(gloss, synonyms)]}
+    for name, p in POS:
+        data = synsets(os.path.join(src, "data." + name))
+        for line in open(os.path.join(src, "index." + name), encoding="utf-8", errors="replace"):
+            if line.startswith("  "):
+                continue
+            f = line.split()
+            lemma, cnt, pcnt = f[0], int(f[2]), int(f[3])
+            offsets = f[4 + pcnt + 2:4 + pcnt + 2 + cnt]
+            word = lemma.replace("_", " ")
+            senses = entries.setdefault(word, {}).setdefault(p, [])
+            for o in offsets:
+                words, gloss = data.get(o, ([], ""))
+                syn = [w for w in words if w.lower() != word.lower()]
+                senses.append((gloss, syn))
+    os.makedirs(dst, exist_ok=True)
+    words = sorted(entries, key=lambda w: (w.encode().lower(), w.encode()))
+    index = {w: i for i, w in enumerate(words)}
+    idx, dic, off = bytearray(), bytearray(), 0
+    for w in words:
+        lines = [w]
+        for p in ("n", "v", "a", "r"):
+            if p not in entries[w]:
+                continue
+            lines.append(" " + NAMES[p])
+            for i, (gloss, syn) in enumerate(entries[w][p], 1):
+                lines.append(f"  {i}. {gloss}")
+                if syn:
+                    lines.append("     = " + ", ".join(syn))
+        body = "\n".join(lines).encode()
+        dic += body
+        idx += w.encode() + b"\0" + struct.pack(">II", off, len(body))
+        off += len(body)
+    # inflected forms: went -> go, children -> child
+    syns = {}
+    for name, p in POS:
+        exc = os.path.join(src, f"{name}.exc")
+        if not os.path.exists(exc):
+            continue
+        for line in open(exc, encoding="utf-8", errors="replace"):
+            f = line.split()
+            if len(f) >= 2:
+                form = f[0].replace("_", " ")
+                base = f[1].replace("_", " ")
+                if base in index and form not in index:
+                    syns.setdefault(form, index[base])
+    syn = bytearray()
+    for form in sorted(syns, key=lambda w: (w.encode().lower(), w.encode())):
+        syn += form.encode() + b"\0" + struct.pack(">I", syns[form])
+    for ext, data in (("idx", idx), ("syn", syn)):
+        open(os.path.join(dst, "wordnet." + ext), "wb").write(data)
+    # the text packed as dictzip (.dict.dz): a third of the size, and sdcv
+    # still jumps straight to one word (on a live USB it all sits in RAM)
+    open(os.path.join(dst, "wordnet.dict.dz"), "wb").write(dictzip(bytes(dic)))
+    open(os.path.join(dst, "wordnet.ifo"), "w").write(
+        "StarDict's dict ifo file\nversion=2.4.2\n"
+        f"wordcount={len(words)}\nsynwordcount={len(syns)}\nidxfilesize={len(idx)}\n"
+        "bookname=WordNet 3.0 (English)\nsametypesequence=m\n"
+        "description=Princeton WordNet 3.0, wordnet.princeton.edu (WordNet License)\n")
+    print(f"wordnet: {len(words)} words, {len(syns)} inflected forms, {len(dic) // 1024} KB")
+
+
+if __name__ == "__main__":
+    main(sys.argv[1], sys.argv[2])

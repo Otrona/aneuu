@@ -1,0 +1,697 @@
+#!/usr/bin/env python3
+# hkb: this laptop as a Bluetooth keyboard for a phone (or a tablet).
+#   hkb      (as root) start; on the phone choose "Aneuu keyboard" once
+#   hkb -d MS  typing speed for R.Ctrl+V/U: MS per key half (default 20);
+#              larger if the phone drops letters (hkb -d 40)
+# Hold Right Ctrl (on Korean laptops the 한자 key) and press:
+#   Tab   keys to the laptop (desk) and back; the phone stays connected
+#   V     type desk's copied text (F6) into the phone
+#   U     type the address of the copy page into the phone
+#   Q     quit
+# Right Ctrl / 한자 never reaches the phone; Left Ctrl is the phone's Ctrl.
+# (Ctrl+Alt keys are avoided: Xfce and QEMU on a host take them.)
+# The copy page (same Wi-Fi, only while hkb runs): shows the laptop's
+# copied text, and takes text from the phone into desk's clipboard (F7).
+# Every key goes to the phone, which types Korean itself (set the phone's
+# physical keyboard to Korean 2-beolsik). Typed text: a line break goes as
+# Shift+Enter (Enter would send a chat message). Right Alt (or the Hangul key)
+# sends Shift+Space, the phone's Korean/English switch.
+# How: Bluetooth HID. bluetoothd runs without its input plugin (it would
+# take the HID channels) and with the keyboard device class; this program
+# publishes the HID service record, waits on L2CAP channels 17 (control)
+# and 19 (interrupt), reads the keyboard with evdev (grabbed, so desk gets
+# nothing) and sends 8-byte keyboard reports. At the end the normal
+# Bluetooth service comes back (headphones too).
+import asyncio
+import html
+import http.server
+import os
+import secrets
+import signal
+import socket
+import subprocess
+import sys
+import threading
+import time
+import urllib.parse
+
+NAME = "Aneuu keyboard"
+HID_UUID = "00001124-0000-1000-8000-00805f9b34fb"
+PSM_CTRL, PSM_INTR = 0x11, 0x13
+CONF = "/run/hkb-main.conf"
+BLUETOOTHD = "/usr/lib/bluetooth/bluetoothd"
+KEY_MS = 20         # typed text: ms key down, ms key up (hkb -d MS)
+
+# Keyboard report descriptor (boot keyboard, report ID 1, LEDs out)
+DESCRIPTOR = (
+    "05010906a1018501050719e029e7150025017501950881029501750881039505"
+    "7501050819012905910295017503910395067508150025650507190029658100"
+    "c0"
+)
+
+SDP_RECORD = """<?xml version="1.0" encoding="UTF-8" ?>
+<record>
+  <attribute id="0x0001"><sequence><uuid value="0x1124" /></sequence></attribute>
+  <attribute id="0x0004">
+    <sequence>
+      <sequence><uuid value="0x0100" /><uint16 value="0x0011" /></sequence>
+      <sequence><uuid value="0x0011" /></sequence>
+    </sequence>
+  </attribute>
+  <attribute id="0x0005"><sequence><uuid value="0x1002" /></sequence></attribute>
+  <attribute id="0x0006">
+    <sequence><uint16 value="0x656e" /><uint16 value="0x006a" /><uint16 value="0x0100" /></sequence>
+  </attribute>
+  <attribute id="0x0009">
+    <sequence><sequence><uuid value="0x1124" /><uint16 value="0x0100" /></sequence></sequence>
+  </attribute>
+  <attribute id="0x000d">
+    <sequence>
+      <sequence>
+        <sequence><uuid value="0x0100" /><uint16 value="0x0013" /></sequence>
+        <sequence><uuid value="0x0011" /></sequence>
+      </sequence>
+    </sequence>
+  </attribute>
+  <attribute id="0x0100"><text value="%(name)s" /></attribute>
+  <attribute id="0x0101"><text value="Keyboard" /></attribute>
+  <attribute id="0x0102"><text value="Aneuu" /></attribute>
+  <attribute id="0x0200"><uint16 value="0x0100" /></attribute>
+  <attribute id="0x0201"><uint16 value="0x0111" /></attribute>
+  <attribute id="0x0202"><uint8 value="0x40" /></attribute>
+  <attribute id="0x0203"><uint8 value="0x00" /></attribute>
+  <attribute id="0x0204"><boolean value="true" /></attribute>
+  <attribute id="0x0205"><boolean value="true" /></attribute>
+  <attribute id="0x0206">
+    <sequence><sequence><uint8 value="0x22" /><text encoding="hex" value="%(desc)s" /></sequence></sequence>
+  </attribute>
+  <attribute id="0x0207">
+    <sequence><sequence><uint16 value="0x0409" /><uint16 value="0x0100" /></sequence></sequence>
+  </attribute>
+  <attribute id="0x020b"><uint16 value="0x0100" /></attribute>
+  <attribute id="0x020c"><uint16 value="0x0c80" /></attribute>
+  <attribute id="0x020d"><boolean value="false" /></attribute>
+  <attribute id="0x020e"><boolean value="true" /></attribute>
+</record>
+""" % {"name": NAME, "desc": DESCRIPTOR}
+
+# evdev key names -> HID usage IDs (keyboard page 0x07)
+_HID = {
+    **{f"KEY_{c}": 4 + i for i, c in enumerate("ABCDEFGHIJKLMNOPQRSTUVWXYZ")},
+    **{f"KEY_{d}": 30 + i for i, d in enumerate("1234567890")},
+    "KEY_ENTER": 40, "KEY_ESC": 41, "KEY_BACKSPACE": 42, "KEY_TAB": 43,
+    "KEY_SPACE": 44, "KEY_MINUS": 45, "KEY_EQUAL": 46, "KEY_LEFTBRACE": 47,
+    "KEY_RIGHTBRACE": 48, "KEY_BACKSLASH": 49, "KEY_SEMICOLON": 51,
+    "KEY_APOSTROPHE": 52, "KEY_GRAVE": 53, "KEY_COMMA": 54, "KEY_DOT": 55,
+    "KEY_SLASH": 56, "KEY_CAPSLOCK": 57,
+    **{f"KEY_F{n}": 57 + n for n in range(1, 13)},
+    "KEY_SYSRQ": 70, "KEY_SCROLLLOCK": 71, "KEY_PAUSE": 72, "KEY_INSERT": 73,
+    "KEY_HOME": 74, "KEY_PAGEUP": 75, "KEY_DELETE": 76, "KEY_END": 77,
+    "KEY_PAGEDOWN": 78, "KEY_RIGHT": 79, "KEY_LEFT": 80, "KEY_DOWN": 81,
+    "KEY_UP": 82, "KEY_NUMLOCK": 83, "KEY_KPSLASH": 84, "KEY_KPASTERISK": 85,
+    "KEY_KPMINUS": 86, "KEY_KPPLUS": 87, "KEY_KPENTER": 88,
+    **{f"KEY_KP{d}": 89 + i for i, d in enumerate("123456789")},
+    "KEY_KP0": 98, "KEY_KPDOT": 99, "KEY_102ND": 100, "KEY_COMPOSE": 101,
+}
+_MOD = {"KEY_LEFTCTRL": 0x01, "KEY_LEFTSHIFT": 0x02, "KEY_LEFTALT": 0x04,
+        "KEY_LEFTMETA": 0x08, "KEY_RIGHTSHIFT": 0x20,
+        "KEY_RIGHTMETA": 0x80}
+# Right Alt and the Hangul key: the phone's Korean/English switch
+_SWITCH = ("KEY_RIGHTALT", "KEY_HANGEUL")
+# Right Ctrl and the Hanja key: hkb's command key, never sent to the phone
+_CMD = ("KEY_RIGHTCTRL", "KEY_HANJA")
+_CMD_KEYS = ("KEY_TAB", "KEY_V", "KEY_U", "KEY_Q")
+
+
+def say(ko, en):
+    print(f"{ko} ({en})", flush=True)
+
+
+class Keys:
+    """Pressed keys -> HID reports; also tracks the command key."""
+
+    def __init__(self):
+        self.mods = 0
+        self.down = []          # HID usages, in the order pressed (max 6)
+        self.held = set()       # evdev names held (for the command key)
+        self.korean = False     # the phone's mode as far as we know
+
+    def report(self):
+        keys = (self.down + [0] * 6)[:6]
+        return bytes([0xA1, 0x01, self.mods, 0] + keys)
+
+    def event(self, name, value):
+        """value 1 press, 0 release, 2 repeat. Returns a list of reports."""
+        if value == 2:
+            return []
+        if value == 1:
+            self.held.add(name)
+        else:
+            self.held.discard(name)
+        if name in _CMD:
+            return []
+        if name in _SWITCH:
+            if value != 1:
+                return []
+            # Shift down, Shift+Space, Space up, Shift up: the phone's 한/영
+            self.korean = not self.korean
+            return [self.report_with(None, shift=True),
+                    self.report_with(44, shift=True),
+                    self.report_with(None, shift=True),
+                    self.report()]
+        if name in _MOD:
+            bit = _MOD[name]
+            self.mods = self.mods | bit if value else self.mods & ~bit
+            return [self.report()]
+        usage = _HID.get(name)
+        if usage is None:
+            return []
+        if value:
+            if usage not in self.down:
+                self.down.append(usage)
+        elif usage in self.down:
+            self.down.remove(usage)
+        return [self.report()]
+
+    def report_with(self, usage, shift=False):
+        mods = self.mods | (0x02 if shift else 0)
+        keys = self.down + ([usage] if usage else [])
+        keys = (keys + [0] * 6)[:6]
+        return bytes([0xA1, 0x01, mods, 0] + keys)
+
+    def command(self):
+        """Right Ctrl or the Hanja key is held."""
+        return bool(set(_CMD) & self.held)
+
+
+# 2-beolsik: initial, medial, final jamo as the keys a person types
+CHO = "r R s e E f a q Q t T d w W c z x v g".split()
+JUNG = "k o i O j p u P h hk ho hl y n nj np nl b m ml l".split()
+JONG = [""] + "r R rt s sw sg e f fr fa fq ft fx fv fg a q qt t T d w c z x v g".split()
+COMPAT = dict(zip(
+    "ㄱㄲㄳㄴㄵㄶㄷㄸㄹㄺㄻㄼㄽㄾㄿㅀㅁㅂㅃㅄㅅㅆㅇㅈㅉㅊㅋㅌㅍㅎ"
+    "ㅏㅐㅑㅒㅓㅔㅕㅖㅗㅘㅙㅚㅛㅜㅝㅞㅟㅠㅡㅢㅣ",
+    "r R rt s sw sg e E f fr fa fq ft fx fv fg a q Q qt t T d w W c z x v g "
+    "k o i O j p u P h hk ho hl y n nj np nl b m ml l".split()))
+# US layout: character -> (evdev key name, shift)
+_SHIFTED = dict(zip('!@#$%^&*()_+{}|:"<>?~', "1234567890-=[]\\;',./`"))
+_PUNCT = {"-": "MINUS", "=": "EQUAL", "[": "LEFTBRACE", "]": "RIGHTBRACE",
+          "\\": "BACKSLASH", ";": "SEMICOLON", "'": "APOSTROPHE", "`": "GRAVE",
+          ",": "COMMA", ".": "DOT", "/": "SLASH", " ": "SPACE",
+          "\n": "ENTER", "\t": "TAB"}
+
+
+def ascii_key(ch):
+    """(HID usage, shift) for a character on a US keyboard, or None."""
+    if ch.isascii() and ch.isalpha():
+        return _HID["KEY_" + ch.upper()], ch.isupper()
+    if ch.isdigit() and ch.isascii():
+        return _HID["KEY_" + ch], False
+    if ch in _SHIFTED:
+        return ascii_key(_SHIFTED[ch])[0], True
+    if ch in _PUNCT:
+        return _HID["KEY_" + _PUNCT[ch]], False
+    return None
+
+
+def hangul_keys(ch):
+    """The 2-beolsik key letters for one Hangul syllable or jamo, or None."""
+    c = ord(ch)
+    if 0xAC00 <= c <= 0xD7A3:
+        c -= 0xAC00
+        return CHO[c // 588] + JUNG[c % 588 // 28] + JONG[c % 28]
+    return COMPAT.get(ch)
+
+
+def plan(text, korean):
+    """Text -> [(usage, shift)] key presses; 'SWITCH' where the phone must
+    change between English and Korean. korean: the phone's mode at the
+    start. Returns (presses, mode at the end, characters skipped)."""
+    out, skipped = [], 0
+    # a line break is Shift+Enter: in chat apps (Gemini ...) Enter sends the
+    # message and the rest would be lost; trailing line breaks are dropped
+    text = text.replace("\r\n", "\n").rstrip("\n")
+    for ch in text:
+        if ch == "\n":
+            out.append((40, True))
+            continue
+        keys = hangul_keys(ch)
+        if keys is not None:
+            if not korean:
+                out.append("SWITCH"); korean = True
+            out += [ascii_key(k) for k in keys]
+            continue
+        k = ascii_key(ch)
+        if k is None:
+            skipped += 1
+            continue
+        if ch.isascii() and ch.isalpha() and korean:
+            out.append("SWITCH"); korean = False
+        out.append(k)
+    return out, korean, skipped
+
+
+def tmux_get():
+    r = subprocess.run(["tmux", "show-buffer"], capture_output=True)
+    return r.stdout.decode("utf-8", "replace") if r.returncode == 0 else ""
+
+
+def tmux_put(text):
+    subprocess.run(["tmux", "load-buffer", "-"], input=text.encode("utf-8"))
+
+
+def my_ip():
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(("192.0.2.1", 9))     # no packet is sent; picks the route
+        return s.getsockname()[0]
+    except OSError:
+        return None
+    finally:
+        s.close()
+
+
+PAGE = """<!doctype html><html lang="ko"><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>다시 복사 (Aneuu copy)</title>
+<style>body{font:18px sans-serif;margin:1em;max-width:40em}
+textarea{width:100%%;font:16px monospace;box-sizing:border-box}
+button{font-size:18px;padding:.4em 1.2em}</style>
+<h2>노트북에 보내기 <small>(send to the laptop)</small></h2>
+<form method="post"><textarea name="text" rows="8"></textarea><br>
+<button>보내기 (send)</button></form>%(note)s
+<h2>노트북에서 복사한 글 <small>(copied on the laptop)</small></h2>
+<textarea rows="8" readonly>%(clip)s</textarea>
+<p>위 글을 길게 눌러 복사하세요 (long-press to copy).</p>
+"""
+
+
+def serve(token, notify):
+    """The copy page, http://IP:PORT/TOKEN, in a thread."""
+    class H(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *a):
+            pass
+
+        def page(self, note=""):
+            body = PAGE % {"note": note, "clip": html.escape(tmux_get())}
+            data = body.encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def do_GET(self):
+            if self.path.rstrip("/") != "/" + token:
+                self.send_error(404)
+                return
+            self.page()
+
+        def do_POST(self):
+            if self.path.rstrip("/") != "/" + token:
+                self.send_error(404)
+                return
+            n = min(int(self.headers.get("Content-Length", 0)), 1 << 20)
+            form = urllib.parse.parse_qs(self.rfile.read(n).decode("utf-8", "replace"))
+            text = form.get("text", [""])[0]
+            if text:
+                tmux_put(text)
+                notify(len(text))
+            self.page("<p><b>받았습니다: %d 글자. 노트북에서 (R.Ctrl+Tab) F7 로 붙여넣기 "
+                      "(received; R.Ctrl+Tab, then F7 pastes it on the laptop)</b></p>" % len(text))
+
+    for port in (8000, 8001, 8080, 0):
+        try:
+            srv = http.server.ThreadingHTTPServer(("0.0.0.0", port), H)
+            break
+        except OSError:
+            continue
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    return srv
+
+
+def keyboards():
+    import evdev
+    found = []
+    for path in evdev.list_devices():
+        try:
+            d = evdev.InputDevice(path)
+            caps = d.capabilities().get(evdev.ecodes.EV_KEY, [])
+            if evdev.ecodes.KEY_A in caps and evdev.ecodes.KEY_ENTER in caps:
+                found.append(d)
+            else:
+                d.close()
+        except OSError:
+            pass
+    return found
+
+
+def start_bluetoothd():
+    subprocess.run(["rc-service", "bluetooth", "stop"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    subprocess.run(["pkill", "-x", "bluetoothd"], stderr=subprocess.DEVNULL)
+    time.sleep(1)
+    with open(CONF, "w") as f:
+        f.write("[General]\nName = %s\nClass = 0x002540\n"
+                "DiscoverableTimeout = 0\nPairableTimeout = 0\n"
+                "JustWorksRepairing = always\n" % NAME)
+    p = subprocess.Popen([BLUETOOTHD, "-n", "-P", "input", "-f", CONF],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
+    return p
+
+
+def stop_bluetoothd(p):
+    if p and p.poll() is None:
+        p.terminate()
+        try:
+            p.wait(5)
+        except subprocess.TimeoutExpired:
+            p.kill()
+    try:
+        os.remove(CONF)
+    except OSError:
+        pass
+    subprocess.run(["rc-service", "bluetooth", "start"],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+
+async def bluez_setup():
+    """Adapter on and visible, an agent that accepts pairing, the HID record."""
+    from dbus_next.aio import MessageBus
+    from dbus_next.constants import BusType
+    from dbus_next.service import ServiceInterface, method
+    from dbus_next import Variant
+
+    class Agent(ServiceInterface):
+        def __init__(self):
+            super().__init__("org.bluez.Agent1")
+
+        @method()
+        def Release(self):
+            pass
+
+        @method()
+        def RequestConfirmation(self, device: "o", passkey: "u"):
+            pass
+
+        @method()
+        def RequestAuthorization(self, device: "o"):
+            pass
+
+        @method()
+        def AuthorizeService(self, device: "o", uuid: "s"):
+            pass
+
+        @method()
+        def Cancel(self):
+            pass
+
+    class Profile(ServiceInterface):
+        def __init__(self):
+            super().__init__("org.bluez.Profile1")
+
+        @method()
+        def Release(self):
+            pass
+
+        @method()
+        def RequestDisconnection(self, device: "o"):
+            pass
+
+    bus = await MessageBus(bus_type=BusType.SYSTEM).connect()
+    for _ in range(20):                       # wait for bluetoothd
+        try:
+            intro = await bus.introspect("org.bluez", "/org/bluez/hci0")
+            break
+        except Exception:
+            await asyncio.sleep(0.5)
+    else:
+        raise RuntimeError("no Bluetooth adapter (hci0)")
+    hci = bus.get_proxy_object("org.bluez", "/org/bluez/hci0", intro)
+    props = hci.get_interface("org.freedesktop.DBus.Properties")
+    for k, v in (("Powered", True), ("Alias", NAME),
+                 ("Pairable", True), ("Discoverable", True)):
+        await props.call_set("org.bluez.Adapter1", k,
+                             Variant("b" if isinstance(v, bool) else "s", v))
+    bus.export("/aneuu/hkb/agent", Agent())
+    bus.export("/aneuu/hkb/profile", Profile())
+    root = bus.get_proxy_object("org.bluez", "/org/bluez",
+                                await bus.introspect("org.bluez", "/org/bluez"))
+    am = root.get_interface("org.bluez.AgentManager1")
+    await am.call_register_agent("/aneuu/hkb/agent", "NoInputNoOutput")
+    await am.call_request_default_agent("/aneuu/hkb/agent")
+    pm = root.get_interface("org.bluez.ProfileManager1")
+    await pm.call_register_profile("/aneuu/hkb/profile", HID_UUID, {
+        "ServiceRecord": Variant("s", SDP_RECORD),
+        "Role": Variant("s", "server"),
+        "RequireAuthentication": Variant("b", False),
+        "RequireAuthorization": Variant("b", False),
+    })
+    return bus
+
+
+def listen(psm):
+    s = socket.socket(socket.AF_BLUETOOTH, socket.SOCK_SEQPACKET,
+                      socket.BTPROTO_L2CAP)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    s.bind((socket.BDADDR_ANY, psm))
+    s.listen(1)
+    return s
+
+
+async def run():
+    import evdev
+    loop = asyncio.get_running_loop()
+    kbs = keyboards()
+    if not kbs:
+        say("키보드를 찾지 못했습니다", "no keyboard found")
+        return 1
+    bt = start_bluetoothd()
+    socks = []
+    bus = None
+    try:
+        bus = await bluez_setup()
+        ctrl_l, intr_l = listen(PSM_CTRL), listen(PSM_INTR)
+        socks += [ctrl_l, intr_l]
+        say(f"폰의 블루투스 목록에서 \"{NAME}\" 을 고르세요 (처음 한 번 연결)",
+            f"on the phone, pick \"{NAME}\" under Bluetooth (pair once)")
+        say("명령 키 R.Ctrl = 오른쪽 Ctrl 또는 한자 키, 폰으로는 안 갑니다",
+            "command key R.Ctrl = Right Ctrl or the Hanja key; never sent to the phone")
+        say("끝내기: 연결 전에는 Ctrl+C, 연결 뒤에는 R.Ctrl+Q",
+            "quit: Ctrl+C before it connects, R.Ctrl+Q after")
+        say("연결 뒤 R.Ctrl+Tab: 키를 노트북(데스크)으로, 다시 누르면 폰으로",
+            "after connecting, R.Ctrl+Tab: keys to the laptop (desk) and back")
+        ctrl, addr = await loop.run_in_executor(None, ctrl_l.accept)
+        socks.append(ctrl)
+        intr, _ = await loop.run_in_executor(None, intr_l.accept)
+        socks.append(intr)
+        say(f"연결됨: {addr[0]}. 이제 모든 키가 폰으로 갑니다",
+            "connected: every key now goes to the phone")
+        say("폰에서 한글: 물리 키보드를 '한국어 두벌식' 으로, 한/영 은 오른쪽 Alt",
+            "Korean: set the phone's physical keyboard to Korean 2-beolsik; Right Alt switches")
+        token = secrets.token_urlsafe(4).replace("-", "x").replace("_", "y")
+        ip = my_ip()
+        url = None
+        if ip and os.environ.get("TMUX"):
+            srv = serve(token, lambda n: say(f"폰에서 받음: {n} 글자, 노트북에서 F7",
+                                             f"from the phone: {n} characters; F7 on the laptop"))
+            url = f"http://{ip}:{srv.server_address[1]}/{token}"
+            say(f"복사 쪽 (같은 와이파이): {url}", f"copy page (same Wi-Fi)")
+            say("R.Ctrl+U: 이 주소를 폰에 입력,  R.Ctrl+V: 복사한 글을 폰에 입력",
+                "R.Ctrl+U types this address on the phone, R.Ctrl+V types copied text")
+        elif not os.environ.get("TMUX"):
+            say("데스크 밖이라 복사/붙여넣기는 없습니다", "outside desk: no copy and paste")
+        else:
+            say("네트워크가 없어 복사 쪽은 없습니다 (R.Ctrl+V 는 됩니다)",
+                "no network: no copy page (R.Ctrl+V still works)")
+        for d in kbs:
+            d.grab()
+        keys = Keys()
+        stop = asyncio.Event()
+        state = {"phone": True, "typing": False, "cancel": False}
+
+        def tell(ko, en):
+            """On this screen and in desk's status line (when keys are on desk)."""
+            say(ko, en)
+            subprocess.run(["tmux", "display-message", "-d", "4000", f"{ko} ({en})"],
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+        def to_phone(yes):
+            state["phone"] = yes
+            for d in kbs:
+                try:
+                    d.grab() if yes else d.ungrab()
+                except OSError:
+                    pass
+            if yes:
+                tell("→ 폰: 키가 폰으로 갑니다 (R.Ctrl+Tab: 노트북)",
+                     "to the phone; R.Ctrl+Tab: laptop")
+            else:
+                try:                    # nothing stays pressed on the phone
+                    intr.send(bytes([0xA1, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]))
+                except OSError:
+                    pass
+                tell("→ 노트북: 데스크를 씁니다, 폰은 연결된 채 (R.Ctrl+Tab: 폰)",
+                     "to the laptop; the phone stays connected; R.Ctrl+Tab: phone")
+
+        def type_text(text):
+            """Type text into the phone, slowly enough that it keeps up.
+            Returns (characters not typable, stopped by Esc)."""
+            presses, _end, skipped = plan(text, keys.korean)
+            # the phone's 한/영: Shift down, Shift+Space, Space up (then empty)
+            switch = [bytes([0xA1, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0]),
+                      bytes([0xA1, 0x01, 0x02, 0, 0x2C, 0, 0, 0, 0, 0]),
+                      bytes([0xA1, 0x01, 0x02, 0, 0, 0, 0, 0, 0, 0])]
+            empty = bytes([0xA1, 0x01, 0, 0, 0, 0, 0, 0, 0, 0])
+            half = KEY_MS / 1000
+            intr.send(empty)
+            done, total = 0, sum(1 for p in presses if p != "SWITCH")
+            for p in presses:
+                if state["cancel"]:
+                    break
+                if p == "SWITCH":
+                    for r in switch:
+                        intr.send(r); time.sleep(half)
+                    intr.send(empty); time.sleep(max(0.15, 4 * half))
+                    keys.korean = not keys.korean   # known even if stopped
+                    continue
+                usage, shift = p
+                intr.send(bytes([0xA1, 0x01, 0x02 if shift else 0, 0, usage, 0, 0, 0, 0, 0]))
+                time.sleep(half)
+                intr.send(empty)
+                time.sleep(half)
+                done += 1
+                if done % 60 == 0 and done < total:
+                    subprocess.run(["tmux", "display-message", "-d", "2000",
+                                    f"폰에 입력 중 {100 * done // total}%, Esc: 멈춤 "
+                                    f"(typing {100 * done // total}%, Esc stops)"],
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            intr.send(empty)               # the laptop's keys are ignored meanwhile
+            return skipped, state["cancel"]
+
+        async def read(dev):
+            async for ev in dev.async_read_loop():
+                if ev.type != evdev.ecodes.EV_KEY:
+                    continue
+                name = evdev.ecodes.KEY.get(ev.code)
+                if isinstance(name, list):
+                    name = name[0]
+                name = name or ""
+                if state["typing"]:
+                    keys.event(name, ev.value)      # track, send nothing
+                    if ev.value == 1 and (name == "KEY_ESC"
+                                          or (name == "KEY_Q" and keys.command())):
+                        state["cancel"] = True
+                    continue
+                if ev.value == 1 and name in _CMD_KEYS and keys.command():
+                    if name == "KEY_TAB":
+                        to_phone(not state["phone"])
+                        continue
+                    if name == "KEY_Q":
+                        if state["phone"]:
+                            try:
+                                intr.send(bytes([0xA1, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]))
+                            except OSError:
+                                pass
+                        stop.set()
+                        return
+                    if not state["phone"]:
+                        continue        # V and U type on the phone only
+                    text = tmux_get() if name == "KEY_V" else (url or "")
+                    if not text:
+                        say("붙여넣을 글이 없습니다 (데스크에서 F6 로 복사)",
+                            "nothing copied (F6 in desk copies)")
+                    else:
+                        state["typing"], state["cancel"] = True, False
+                        tell(f"폰에 입력 중: {len(text)} 글자, Esc: 멈춤",
+                             f"typing {len(text)} characters; Esc stops")
+                        try:
+                            n, stopped = await loop.run_in_executor(None, type_text, text)
+                        except OSError:
+                            say("폰과 연결이 끊겼습니다", "the phone disconnected")
+                            stop.set()
+                            return
+                        finally:
+                            state["typing"] = False
+                        if stopped:
+                            tell("입력을 멈췄습니다", "typing stopped")
+                        else:
+                            tell(f"폰에 보냄: {len(text) - n} 글자"
+                                 + (f", 못 넣은 글자 {n} 개" if n else "")
+                                 + " (빠지면 hkb -d 40)",
+                                 "sent; if letters are missing: hkb -d 40")
+                    continue
+                if not state["phone"]:
+                    # keys go to desk; only keep track, for the command key
+                    keys.event(name, ev.value)
+                    continue
+                for r in keys.event(name, ev.value):
+                    try:
+                        intr.send(r)
+                    except OSError:
+                        say("폰과 연결이 끊겼습니다", "the phone disconnected")
+                        stop.set()
+                        return
+
+        tasks = [asyncio.ensure_future(read(d)) for d in kbs]
+        await stop.wait()
+        for t in tasks:
+            t.cancel()
+        return 0
+    finally:
+        for d in kbs:
+            try:
+                d.ungrab()
+            except OSError:
+                pass
+        for so in socks:
+            try:
+                so.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            so.close()
+        if bus:
+            bus.disconnect()
+        stop_bluetoothd(bt)
+        say("키보드가 다시 이 노트북으로 (블루투스 원래대로)",
+            "keyboard back on this laptop (Bluetooth as before)")
+
+
+def main():
+    global KEY_MS
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print("".join(l[2:] for l in open(__file__, encoding="utf-8").readlines()[1:12]), end="")
+        return 0
+    if args and args[0] == "-d":
+        try:
+            KEY_MS = max(5, min(200, int(args[1])))
+        except (IndexError, ValueError):
+            say("hkb -d 숫자 (밀리초, 예: hkb -d 40)", "hkb -d NUMBER (ms, e.g. hkb -d 40)")
+            return 1
+    if os.geteuid() != 0:
+        say("root 로 실행하세요", "run as root")
+        return 1
+    if not os.path.exists(BLUETOOTHD):
+        say("블루투스가 없습니다", "no Bluetooth on this system")
+        return 1
+    try:
+        import evdev  # noqa: F401
+        import dbus_next  # noqa: F401
+    except ImportError:
+        say("py3-evdev 또는 py3-dbus-next 가 없습니다", "py3-evdev or py3-dbus-next is missing")
+        return 1
+    def on_term(signo, frame):
+        raise KeyboardInterrupt
+    signal.signal(signal.SIGTERM, on_term)
+    try:
+        return asyncio.run(run())
+    except KeyboardInterrupt:
+        return 130
+    except Exception as e:      # say what went wrong, plainly
+        say(f"멈췄습니다: {e}", "stopped")
+        return 1
+
+
+sys.exit(main())

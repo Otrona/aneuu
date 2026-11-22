@@ -1,0 +1,114 @@
+diff --git a/src/im_handler.c b/src/im_handler.c
+index 823f1f5..50eae01 100644
+--- a/src/im_handler.c
++++ b/src/im_handler.c
+@@ -137,6 +137,43 @@ handle_stdin_write_remain (const int fd_child)
+     }
+ }
+ 
++/* Aneuu: switch Korean input from outside. SIGUSR1: English now (a
++   syllable being typed is finished first); SIGUSR2: Korean again if it
++   was on before. hfb does this while a video plays, so that single keys
++   (q v s) arrive as typed, not held back as an unfinished syllable. */
++static BOOL han_forced = FALSE, han_was_on = FALSE;
++
++void
++han_ime_force (im_handler_status *p_status, const int fd_child,
++               const BOOL english)
++{
++  if (english)
++    {
++      /* the mode to come back to: the one before the first USR1 */
++      if (!han_forced)
++        han_was_on = p_status->im_mode ? TRUE : FALSE;
++      han_forced = TRUE;
++      if (p_status->im_mode)
++        {
++          handle_stdin_write_remain (fd_child);
++          p_status->im_mode = FALSE;
++          han_ime_notify (FALSE);
++        }
++    }
++  else
++    {
++      if (!han_forced)
++        return;
++      han_forced = FALSE;
++      if (han_was_on && !p_status->im_mode)
++        {
++          p_status->im_mode = ~((BOOL)FALSE);
++          han_ime_notify (TRUE);
++        }
++    }
++  p_status->toggle = IM_HANDLER_TOGGLE__OFF;
++}
++
+ #ifndef im_handler__CONTROL_H /* C-h */
+ #define im_handler__CONTROL_H 0x08
+ #endif
+@@ -165,6 +202,7 @@ handle_stdin (im_handler_status *p_status, const int fd_keyin,
+         {
+           /* TOGGLE key */
+           p_status->im_mode = ~(p_status->im_mode);
++          han_forced = FALSE; /* Aneuu: the user's own choice wins over USR2 */
+           han_ime_notify (p_status->im_mode ? TRUE : FALSE);
+ 
+           if (p_status->im_mode == FALSE)
+diff --git a/src/im_handler.h b/src/im_handler.h
+index 4928436..902bc6e 100644
+--- a/src/im_handler.h
++++ b/src/im_handler.h
+@@ -104,6 +104,10 @@ EXTERN_ void set_current_handle_input_status (void *p_new_status);
+ EXTERN_
+ void im_handler_status__empty (im_handler_status *p_status);
+ 
++/* Aneuu: SIGUSR1/SIGUSR2 -> English / Korean again (see im_handler.c) */
++void han_ime_force (im_handler_status *p_status, const int fd_child,
++                    const BOOL english);
++
+ /**
+  * 표준입력 처리 함수
+  *
+diff --git a/src/main_ddakong.c b/src/main_ddakong.c
+index 54fef44..d1cbfea 100644
+--- a/src/main_ddakong.c
++++ b/src/main_ddakong.c
+@@ -186,6 +186,16 @@ handle_stdin_written (const ssize_t n_written, const BYTE *buf, void *aux)
+     }
+ }
+ 
++/* Aneuu: SIGUSR1 = English, SIGUSR2 = Korean again; applied in the main
++   loop (the handler only notes it) */
++static volatile sig_atomic_t han_sig = 0;
++
++static void
++trap_usr (int signo)
++{
++  han_sig = (signo == SIGUSR1) ? 1 : 2;
++}
++
+ int
+ main (int argc, char **argv)
+ {
+@@ -247,6 +257,8 @@ main (int argc, char **argv)
+   signal_trap_norecover (SIGCHLD, &trap_chld);
+   signal_trap_norecover (SIGWINCH, &trap_winch);
+   signal_trap_norecover (SIGTERM, &trap_term);
++  signal_trap_norecover (SIGUSR1, &trap_usr);
++  signal_trap_norecover (SIGUSR2, &trap_usr);
+ 
+   /* terminal size, echo, control-keys */
+   winsz_update (child_fd);
+@@ -323,6 +335,12 @@ main (int argc, char **argv)
+   while (1)
+     {
+       int nfds = pollfd_wait (p_pollfd, fds, MAX_EVTS);
++      if (han_sig)
++        {
++          int s = han_sig;
++          han_sig = 0;
++          han_ime_force (p_handle_input_status, child_fd, s == 1);
++        }
+       if (nfds == -1)
+         {
+           continue;

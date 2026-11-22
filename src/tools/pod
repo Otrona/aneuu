@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+# pod: podcasts, simply.
+#   pod              your podcasts; pick a number, then an episode
+#   pod WORDS        find a podcast by name and subscribe (e.g. pod this american life)
+# The episode plays in the background and pod ends: go on working. Alt+P shows the
+# player (Space pause, Left/Right 10 s, 9 0 volume, s faster, q stop); Alt+P or Esc
+# hides it again. Where you stopped is remembered.
+#   pod --player     the player panel (what Alt+P opens)
+import curses, json, os, re, socket, subprocess, sys, time, urllib.parse, urllib.request
+from xml.etree import ElementTree as ET
+
+KO = bool(os.environ.get("HAN_ACTIVE"))
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "han")
+SUBS = os.path.join(CONF, "podcasts")
+SOCK = "/tmp/han-pod.sock"
+LOG = "/tmp/han-pod.log"
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64) pod/1.0"}
+Y, C, D, R = "\033[1;33m", "\033[36m", "\033[2m", "\033[0m"
+
+
+def say(ko, en):
+    return ko if KO else en
+
+
+def get(url, timeout=20):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read()
+
+
+def load_subs():
+    try:
+        rows = [l.rstrip("\n").split("\t") for l in open(SUBS, encoding="utf-8")]
+        return [(r[0], r[1]) for r in rows if len(r) >= 2]
+    except OSError:
+        return []
+
+
+def save_subs(subs):
+    os.makedirs(CONF, exist_ok=True)
+    with open(SUBS, "w", encoding="utf-8") as f:
+        for t, u in subs:
+            f.write(f"{t}\t{u}\n")
+
+
+def ask(prompt):
+    try:
+        return input(prompt).strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return "q"
+
+
+def search(words):
+    """Podcasts by name (Apple's podcast directory): [(title, author, feed)]"""
+    url = "https://itunes.apple.com/search?" + urllib.parse.urlencode(
+        {"media": "podcast", "limit": 12, "term": words})
+    data = json.loads(get(url))
+    return [(r.get("collectionName", "?"), r.get("artistName", ""), r["feedUrl"])
+            for r in data.get("results", []) if r.get("feedUrl")]
+
+
+def subscribe(words, subs):
+    print(say("찾는 중...", "Searching..."))
+    try:
+        found = search(words)
+    except Exception as e:
+        print(say(f"찾지 못했습니다 (인터넷 연결?): {e}", f"Search failed (online?): {e}"))
+        return
+    if not found:
+        print(say("없습니다. 다른 말로 찾아 보세요.", "Nothing found. Try other words."))
+        return
+    print()
+    for i, (t, a, _) in enumerate(found, 1):
+        print(f"{Y}{i:3d}){R} {t}  {D}{a}{R}")
+    a = ask(say("구독할 번호 (Enter 취소) > ", "Number to subscribe (Enter cancels) > "))
+    if a.isdigit() and 1 <= int(a) <= len(found):
+        t, _, u = found[int(a) - 1]
+        if u not in (s[1] for s in subs):
+            subs.append((t, u))
+            save_subs(subs)
+        print(say(f"구독했습니다: {t}", f"Subscribed: {t}"))
+
+
+def episodes(feed):
+    root = ET.fromstring(get(feed, 40))
+    it = "{http://www.itunes.com/dtds/podcast-1.0.dtd}"
+    out = []
+    for item in root.iter("item"):
+        enc = item.find("enclosure")
+        if enc is None or not enc.get("url"):
+            continue
+        date = (item.findtext("pubDate") or "").strip()
+        m = re.search(r"(\d{1,2}) (\w{3}) (\d{4})", date)
+        mon = "JanFebMarAprMayJunJulAugSepOctNovDec"
+        date = (f"{m.group(3)}-{mon.find(m.group(2)) // 3 + 1:02d}-{int(m.group(1)):02d}"
+                if m and m.group(2) in mon else date[:10])
+        dur = (item.findtext(it + "duration") or "").strip()
+        if dur.isdigit():
+            s = int(dur)
+            dur = f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+        out.append(((item.findtext("title") or "?").strip(), date, dur, enc.get("url")))
+    return out
+
+
+def mpv(*cmd):
+    """Send a command to the playing mpv; its answer, or None."""
+    try:
+        c = socket.socket(socket.AF_UNIX)
+        c.settimeout(1)
+        c.connect(SOCK)
+        c.sendall(json.dumps({"command": list(cmd)}).encode() + b"\n")
+        data = b""
+        while not data.endswith(b"\n"):
+            part = c.recv(4096)
+            if not part:
+                break
+            data += part
+        c.close()
+        for line in data.decode("utf-8", "replace").splitlines():
+            m = json.loads(line)
+            if "error" in m:
+                return m.get("data") if m["error"] == "success" else None
+    except (OSError, ValueError):
+        return None
+
+
+def playing():
+    return os.path.exists(SOCK) and mpv("get_property", "pid") is not None
+
+
+def final_url(url):
+    """Follow the episode's redirects (trackers) here, so mpv has one address."""
+    for _ in range(2):
+        try:
+            req = urllib.request.Request(url, headers=UA, method="HEAD")
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return r.geturl()
+        except Exception:
+            time.sleep(1)
+    return url
+
+
+def play(title, url, again=True):
+    if playing():
+        mpv("quit-watch-later")
+        time.sleep(0.5)
+    try:
+        os.remove(SOCK)
+    except OSError:
+        pass
+    print(say("여는 중...", "Opening..."))
+    real = final_url(url)
+    cmd = ["/usr/bin/mpv", "--no-video", "--no-terminal", "--save-position-on-quit",
+           "--input-ipc-server=" + SOCK, "--log-file=" + LOG,
+           "--force-media-title=" + title, real]
+    p = subprocess.Popen(cmd, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                         stderr=subprocess.DEVNULL, start_new_session=True)
+    for _ in range(40):                          # up to 20 s for the first sound
+        time.sleep(0.5)
+        if p.poll() is not None:
+            break
+        if mpv("get_property", "time-pos") is not None:
+            print(say(f"듣는 중: {title}\n  다른 일을 해도 계속됩니다. Alt+P 로 보기 (멈춤, 넘기기, 끝)",
+                      f"Playing: {title}\n  It goes on while you work. Alt+P shows it (pause, skip, stop)"))
+            return True
+    if p.poll() is None:
+        print(say("아직 소리가 나지 않습니다 (느린 연결?). 잠시 기다리거나 Alt+P 로 보세요.",
+                  "No sound yet (slow connection?). Wait a little, or look with Alt+P."))
+        return True
+    try:
+        errs = [l.split("]", 2)[-1].strip() for l in open(LOG, encoding="utf-8", errors="replace")
+                if "][e]" in l or "][f]" in l]
+    except OSError:
+        errs = []
+    if again and any("resolve" in e or "Try again" in e for e in errs):
+        print(say("인터넷 주소를 찾지 못했습니다. 한 번 더 해 봅니다...",
+                  "Could not look up the address. Trying once more..."))
+        time.sleep(2)
+        return play(title, url, again=False)
+    print(say("이 회차를 틀지 못했습니다. mpv 가 한 말:", "Could not play this episode. mpv said:"))
+    for e in errs[-3:] or ["?"]:
+        print("  " + (e if len(e) < 160 else e[:157] + "..."))
+
+
+def clock(s):
+    if s is None:
+        return "--:--"
+    s = int(s)
+    return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}" if s >= 3600 else f"{s // 60}:{s % 60:02d}"
+
+
+def player(scr):
+    """The panel Alt+P shows: what plays, where, and the keys."""
+    curses.curs_set(0)
+    scr.timeout(500)
+    keys = say("Space 멈춤  ← → 10초  9 0 소리", "Space pause  Left/Right 10 s  9 0 volume")
+    keys2 = say("s 빠르게 (1.1 ~ 1.8, 여섯 단계)  q 끝", "s faster (1.1 ... 1.8, 6 steps)  q stop")
+    hide = say("Alt+P 나 Esc: 숨기기 (소리는 계속)", "Alt+P or Esc: hide (it keeps playing)")
+    while True:
+        if not playing():
+            return
+        title = mpv("get_property", "media-title") or ""
+        pos, dur = mpv("get_property", "time-pos"), mpv("get_property", "duration")
+        paused, vol = mpv("get_property", "pause"), mpv("get_property", "volume")
+        state = say(" (멈춤)", " (paused)") if paused else ""
+        speed = mpv("get_property", "speed") or 1
+        if abs(speed - 1) > 0.01:
+            state += f"  {speed:.2f}x"
+        scr.erase()
+        h, w = scr.getmaxyx()
+        for y, text in enumerate([title, f"{clock(pos)} / {clock(dur)}{state}   vol {int(vol or 0)}%",
+                                  keys, keys2, hide]):
+            if y < h:
+                try:
+                    scr.addstr(y, 0, text[:max(1, w - 1)])
+                except curses.error:
+                    pass
+        scr.refresh()
+        k = scr.getch()
+        if k == 0xE3:                     # Korean input on: ㅂ ㄴ arrive as 3 bytes
+            b = bytes([k, scr.getch() & 0xFF, scr.getch() & 0xFF]).decode("utf-8", "replace")
+            k = {"ㅂ": ord("q"), "ㄴ": ord("s")}.get(b, -1)
+        if k == 27:
+            scr.timeout(50)
+            n = scr.getch()
+            scr.timeout(500)
+            if n in (-1, ord("p"), ord("P")):
+                return
+            k = {ord("[") : -1}.get(n, -1)
+        if k == ord(" "):
+            mpv("cycle", "pause")
+        elif k in (curses.KEY_LEFT, ord("h")):
+            mpv("seek", -10)
+        elif k in (curses.KEY_RIGHT, ord("l")):
+            mpv("seek", 10)
+        elif k == ord("9"):
+            mpv("add", "volume", -5)
+        elif k == ord("0"):
+            mpv("add", "volume", 5)
+        elif k in (ord("s"), ord("S")):      # faster: 1.1 1.25 1.35 1.45 1.65 1.8, then normal
+            mpv("cycle-values", "speed", "1.1", "1.25", "1.35", "1.45", "1.65", "1.8", "1")
+        elif k in (ord("q"), ord("Q")):
+            mpv("quit-watch-later")
+            return
+
+
+def show_episodes(title, feed):
+    print(say("받는 중...", "Loading..."))
+    try:
+        eps = episodes(feed)
+    except Exception as e:
+        print(say(f"이 팟캐스트를 열지 못했습니다: {e}", f"Cannot open this podcast: {e}"))
+        return
+    eps = eps[:20]
+    while True:
+        print(f"\n{title}")
+        for i, (t, d, du, _) in enumerate(eps, 1):
+            print(f"{Y}{i:3d}){R} {C}{d}{R} {D}{du:>8}{R}  {t}")
+        a = ask(say("들을 번호, , 뒤로, q 끝 > ", "Number to play, , back, q quit > "))
+        if a in ("q", "Q"):
+            sys.exit(0)
+        if a in (",", "", "<"):
+            return
+        if a.isdigit() and 1 <= int(a) <= len(eps):
+            t, _, _, u = eps[int(a) - 1]
+            if play(t, u):                # playing: pod is done, the shell is yours again
+                sys.exit(0)
+
+
+def main():
+    try:                                  # show as "pod" (F12 keys, window name)
+        open("/proc/self/comm", "w").write("pod")
+    except OSError:
+        pass
+    args = sys.argv[1:]
+    if args and args[0] == "--player":
+        if playing():
+            # Korean input on: a lone ㅂ ㄴ would wait for the next key, so this
+            # pane is marked for English keys while it has focus (enkeys)
+            pane = os.environ.get("TMUX_PANE")
+            enk = "/usr/local/lib/han/enkeys"
+            if pane:
+                subprocess.run(["tmux", "set", "-p", "-t", pane, "@enkeys", "1"], stderr=subprocess.DEVNULL)
+            subprocess.run([enk, pane or "on"], stderr=subprocess.DEVNULL)
+            try:
+                curses.wrapper(player)
+            finally:
+                if pane:
+                    subprocess.run(["tmux", "set", "-pu", "-t", pane, "@enkeys"], stderr=subprocess.DEVNULL)
+                subprocess.run([enk] if pane else [enk, "off"], stderr=subprocess.DEVNULL)
+        return
+    if args and args[0] in ("-h", "--help"):
+        print("".join(l[2:] for l in open(__file__, encoding="utf-8").readlines()[1:9]), end="")
+        return
+    subs = load_subs()
+    if args:
+        subscribe(" ".join(args), subs)
+    while True:
+        print()
+        if not subs:
+            print(say("구독한 팟캐스트가 없습니다. 이름을 입력해 찾으세요 (예: this american life).",
+                      "No podcasts yet. Type a name to find one (e.g. this american life)."))
+        for i, (t, _) in enumerate(subs, 1):
+            print(f"{Y}{i:3d}){R} {t}")
+        a = ask(say("번호 = 열기, 이름 = 찾아서 구독, -번호 = 구독 끊기, q = 끝 > ",
+                    "number = open, a name = find and subscribe, -number = remove, q = quit > "))
+        if a in ("q", "Q", ""):
+            return
+        if a.isdigit() and 1 <= int(a) <= len(subs):
+            show_episodes(*subs[int(a) - 1])
+        elif a.startswith("-") and a[1:].isdigit() and 1 <= int(a[1:]) <= len(subs):
+            t = subs.pop(int(a[1:]) - 1)[0]
+            save_subs(subs)
+            print(say(f"구독을 끊었습니다: {t}", f"Removed: {t}"))
+        elif not a.isdigit():
+            subscribe(a, subs)
+
+
+if __name__ == "__main__":
+    main()

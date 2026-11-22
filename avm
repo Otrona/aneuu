@@ -1,0 +1,161 @@
+#!/bin/sh
+# avm: try Aneuu in a QEMU virtual machine (run from the folder with aneuu-out/)
+#
+#   avm                 live USB test: 64-bit ISO, BIOS, 2 GB memory
+#   avm 32              the 32-bit ISO on an old netbook CPU (Atom N270), 1 GB
+#   avm uefi            start with UEFI instead of BIOS (64-bit only)
+#   avm disk            also an empty 20 GB hard disk, to test han-inst
+#   avm hd              start the installed hard disk, without the ISO
+#   avm usb             also plug in a test USB stick with Korean file names
+#   avm pass 8087:0a2b  give a real USB device to the VM (Bluetooth or Wi-Fi
+#                       dongle, or the laptop's own Bluetooth): see lsusb
+#   avm mem 512         memory in MB (old laptops: 512, 1024)
+#   avm iso FILE        another ISO
+#   avm fs              start full screen (Ctrl+Alt+F switches any time)
+#
+# Words combine:  avm 32 disk usb mem 512     DRY=1 avm ...  only prints it
+# The window opens at 50% of the screen width, scaled (ZOOM=60 avm: bigger,
+# ZOOM=0 avm: QEMU's normal size). The screen keeps 4:3 always, also full
+# screen (black bars at the sides). Ctrl+Alt+F full screen on/off,
+# Ctrl+Alt+G frees the mouse. UI=gtk avm: QEMU's old window with menus.
+set -eu
+
+arch=64 fw=bios mem="" disk=no boot=iso usb=no pass="" iso="" fs=off
+while [ $# -gt 0 ]; do
+	case "$1" in
+		32)   arch=32 ;;
+		64)   arch=64 ;;
+		uefi) fw=uefi ;;
+		disk) disk=yes ;;
+		hd)   disk=yes; boot=hd ;;
+		usb)  usb=yes ;;
+		pass) pass="$pass ${2:?avm pass VENDOR:PRODUCT}"; shift ;;
+		mem)  mem="${2:?avm mem MB}"; shift ;;
+		iso)  iso="${2:?avm iso FILE}"; shift ;;
+		fs)   fs=on ;;
+		-h|--help|help) sed -n '2,20p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+		*) echo "avm: unknown word '$1' (avm help)" >&2; exit 1 ;;
+	esac
+	shift
+done
+
+if [ $arch = 32 ]; then
+	Q=qemu-system-i386 cpu=n270
+	: "${mem:=1024}" "${iso:=aneuu-out/aneuu-0-x86.iso}"
+	[ $fw = bios ] || { echo "avm: 32-bit is tested with BIOS only" >&2; exit 1; }
+	DISK=aneuu-disk32.qcow2
+else
+	Q=qemu-system-x86_64 cpu=host
+	: "${mem:=2048}" "${iso:=aneuu-out/aneuu-0-x86_64.iso}"
+	DISK=aneuu-disk.qcow2
+fi
+command -v $Q >/dev/null || { echo "Install QEMU first:  sudo apt install qemu-system-x86 qemu-utils ovmf" >&2; exit 1; }
+
+# sound through your desktop's PipeWire; under sudo there is none to reach
+snd=pa; [ "$(id -u)" = 0 ] && snd=none
+set -- -name "Aneuu $arch-bit $fw $boot" -m "$mem" -smp 2
+# the clock in local time, like a laptop that came with Windows (Aneuu
+# sets hwclock to "local"); QEMU keeps UTC by default
+set -- "$@" -rtc base=localtime
+if [ -w /dev/kvm ]; then
+	set -- "$@" -enable-kvm -cpu "$cpu"
+else
+	echo "avm: no /dev/kvm access, running slowly (sudo usermod -aG kvm "$(id -un)", then log in again)"
+	[ $arch = 32 ] && set -- "$@" -cpu "$cpu"
+fi
+# SDL, not GTK: QEMU's GTK window stretches 4:3 to the whole screen in full
+# screen; SDL keeps 4:3 (bars at the sides). It has no menu bar either, so
+# Alt+V and F10 reach the VM.
+if [ "${UI:-sdl}" = gtk ]; then
+	ui="gtk,zoom-to-fit=on,full-screen=$fs"
+else
+	ui="sdl,full-screen=$fs"
+fi
+# screen with KMS (virtio-gpu), wired network, sound, USB 3
+# 640x480: a small 4:3 screen (like an old laptop), so that scaling it up
+# to the window below makes the text big. Standard VGA, not virtio-gpu:
+# virtio-gpu resizes the VM screen to the window, so nothing got bigger.
+set -- "$@" -device VGA,xres=640,yres=480,edid=on -display "$ui" \
+	-nic user,model=e1000 \
+	-audiodev "$snd",id=snd -device intel-hda -device hda-duplex,audiodev=snd \
+	-device qemu-xhci,id=xhci -device usb-tablet,bus=xhci.0
+
+if [ $fw = uefi ]; then
+	if [ -f /usr/share/ovmf/OVMF.fd ]; then
+		set -- "$@" -bios /usr/share/ovmf/OVMF.fd
+	elif [ -f /usr/share/OVMF/OVMF_CODE_4M.fd ]; then
+		[ -f aneuu-vars.fd ] || cp /usr/share/OVMF/OVMF_VARS_4M.fd aneuu-vars.fd
+		set -- "$@" -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+			-drive if=pflash,format=raw,file=aneuu-vars.fd
+	else
+		echo "avm: UEFI firmware not found:  sudo apt install ovmf" >&2; exit 1
+	fi
+fi
+
+if [ $boot = iso ]; then
+	[ -f "$iso" ] || { echo "avm: $iso not found (build it first, or: avm iso FILE)" >&2; exit 1; }
+	set -- "$@" -drive "file=$iso,media=cdrom,readonly=on" -boot d
+fi
+
+if [ $disk = yes ]; then
+	if [ ! -f "$DISK" ]; then
+		[ $boot = hd ] && { echo "avm: no $DISK yet: first  avm disk  and run han-inst" >&2; exit 1; }
+		qemu-img create -q -f qcow2 "$DISK" 20G
+		echo "avm: new empty disk $DISK (20 GB, grows as used)"
+	fi
+	# a SATA disk, like a laptop's: it shows up as /dev/sda
+	set -- "$@" -device ahci,id=ahci -drive "file=$DISK,if=none,id=hd" \
+		-device ide-hd,drive=hd,bus=ahci.0
+	[ $boot = hd ] && set -- "$@" -boot c
+fi
+
+if [ $usb = yes ]; then
+	if [ ! -f aneuu-usb.img ]; then
+		command -v mkfs.vfat >/dev/null && command -v mcopy >/dev/null ||
+			{ echo "avm: for the test stick:  sudo apt install dosfstools mtools" >&2; exit 1; }
+		mkfs.vfat -C -n TESTUSB aneuu-usb.img 65536 >/dev/null
+		t="$(mktemp -d)"
+		printf '안녕하세요. 한글 파일 이름 시험입니다.\nHello from the test stick.\n' > "$t/한글 문서.txt"
+		printf 'Aneuu USB test\n' > "$t/readme.txt"
+		LC_ALL=C.UTF-8 mcopy -i aneuu-usb.img "$t/한글 문서.txt" "$t/readme.txt" ::/
+		rm -rf "$t"
+		echo "avm: new test stick aneuu-usb.img (FAT, 64 MB, Korean file name)"
+	fi
+	set -- "$@" -drive file=aneuu-usb.img,if=none,id=stick,format=raw \
+		-device usb-storage,bus=xhci.0,drive=stick,removable=on
+fi
+
+for d in $pass; do
+	set -- "$@" -device "usb-host,bus=xhci.0,vendorid=0x${d%%:*},productid=0x${d##*:}"
+done
+[ -n "$pass" ] && [ "$(id -u)" != 0 ] &&
+	echo "avm: passing a USB device usually needs root:  sudo avm ..."
+
+if [ "${DRY:-}" = 1 ]; then echo $Q "$@"; exit 0; fi
+# Make the window big; with zoom-to-fit QEMU scales the screen to it.
+# Find it by QEMU's process id: a title search can hit the terminal too.
+z="${ZOOM:-50}"
+if [ "$z" != 0 ] && [ $fs = off ] && command -v xdotool >/dev/null 2>&1; then
+	$Q "$@" &
+	pid=$!
+	w=""
+	for i in 1 2 3 4 5 6 7 8 9 10; do
+		w="$(xdotool search --onlyvisible --pid "$pid" 2>/dev/null | tail -n1)"
+		[ -n "$w" ] && break
+		sleep 1
+	done
+	if [ -n "$w" ]; then
+		set -- $(xdotool getdisplaygeometry)
+		# a 4:3 screen (plus the menu bar of the GTK window)
+		mb=0; [ "${UI:-sdl}" = gtk ] && mb=30
+		ww=$(($1 * z / 100)); wh=$((ww * 3 / 4 + mb))
+		xdotool windowmove "$w" $(($1 / 40)) $(($2 / 40))
+		xdotool windowsize "$w" "$ww" "$wh"
+		echo "avm: window set to ${ww}x${wh} ($z% of the screen width)"
+	else
+		echo "avm: VM window not found, left at normal size"
+	fi
+	wait $pid
+else
+	exec $Q "$@"
+fi

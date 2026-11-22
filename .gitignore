@@ -1,0 +1,11 @@
+# build output and logs
+aneuu-out/
+*.iso
+*.log
+# Docker data image
+docker.img
+containerd/
+# editor and Python leftovers
+__pycache__/
+*.pyc
+*~

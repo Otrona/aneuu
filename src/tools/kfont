@@ -1,0 +1,136 @@
+#!/usr/bin/env python3
+# kfont: put Aneuu's console font into the cjktty kernel patch, before the
+# kernel is compiled. The patch carries lib/fonts/font_cjk_16x16.h, the
+# kernel console's whole 16 px font table; this replaces glyphs in it:
+#   English  0x20-0x7E, 0xA0-0xFF                from an 8x16 font (Terminus)
+#   Hangul   AC00-D7A3, 1100-11FF, 3131-318E     from a 16x16 font (DOSMyungjo)
+# Characters a font does not have keep cjktty's own glyph.
+# Table layout: chars 0-255 one line of 16 bytes (16 rows, 8 px wide);
+# every other char two lines: left half (16 rows), then right half.
+# Only the byte values change, never the number of lines, so the patch's
+# hunk header stays valid.
+#   kfont PATCH LATIN-FONT KOREAN-FONT     (rewrites PATCH in place)
+# Fonts: TTF/OTB (drawn at 16 px) or 16 px BDF.
+import re
+import sys
+from PIL import Image, ImageDraw, ImageFont
+from fontTools.ttLib import TTFont
+
+LATIN = list(range(0x20, 0x7F)) + list(range(0xA0, 0x100))
+HANGUL = list(range(0xAC00, 0xD7A4)) + list(range(0x1100, 0x1200)) + list(range(0x3131, 0x318F))
+TABLE = "+++ b/lib/fonts/font_cjk_16x16.h"
+
+
+def bdf_glyphs(path, chars, width):
+    """{char: rows} from a 16 px BDF font, placed by its own baseline."""
+    asc = desc = None
+    out = {}
+    want = set(chars)
+    c = bbx = bits = None
+    for line in open(path, encoding="latin-1"):
+        w = line.split()
+        if not w:
+            continue
+        if w[0] == "FONT_ASCENT":
+            asc = int(w[1])
+        elif w[0] == "FONT_DESCENT":
+            desc = int(w[1])
+        elif w[0] == "ENCODING":
+            c = int(w[1])
+        elif w[0] == "BBX":
+            bbx = [int(v) for v in w[1:5]]
+        elif w[0] == "BITMAP":
+            bits = []
+        elif w[0] == "ENDCHAR":
+            if c in want and bits is not None:
+                out[c] = bdf_rows(asc, bbx, bits, width)
+            c = bbx = bits = None
+        elif bits is not None:
+            bits.append(w[0])
+    if asc is None or desc is None or asc + desc != 16:
+        sys.exit(f"kfont: {path}: not a 16 px BDF font")
+    return out
+
+
+def bdf_rows(asc, bbx, bits, width):
+    """One BDF glyph into 16 rows of WIDTH bits; the baseline is row ASC."""
+    bw, bh, bx, by = bbx
+    top = asc - by - bh
+    rows = [0] * 16
+    for r, hexrow in enumerate(bits):
+        y = top + r
+        if not 0 <= y < 16:
+            continue
+        v, n = int(hexrow, 16), len(hexrow) * 4
+        for x in range(bw):
+            if v >> (n - 1 - x) & 1 and 0 <= bx + x < width:
+                rows[y] |= 1 << (width - 1 - bx - x)
+    return rows
+
+
+def glyphs(path, chars, width):
+    """{char: list of rows as ints}, drawn without smoothing, top at row 0."""
+    if path.endswith(".bdf"):
+        return bdf_glyphs(path, chars, width)
+    have = TTFont(path, fontNumber=0).getBestCmap()
+    font = ImageFont.truetype(path, 16)
+    asc, desc = font.getmetrics()
+    if asc + desc != 16:
+        sys.exit(f"kfont: {path}: {asc}+{desc} is not a 16 px font")
+    out = {}
+    for c in chars:
+        if c not in have:
+            continue
+        im = Image.new("1", (width, 16), 0)
+        d = ImageDraw.Draw(im)
+        d.fontmode = "1"
+        d.text((0, 0), chr(c), font=font, fill=1)
+        out[c] = [sum(1 << (width - 1 - x) for x in range(width) if im.getpixel((x, y)))
+                  for y in range(16)]
+    return out
+
+
+def line(values):
+    return "+" + "".join(f"0x{v:02x}," for v in values)
+
+
+def main():
+    if len(sys.argv) != 4:
+        sys.exit("usage: kfont PATCH LATIN-FONT KOREAN-FONT")
+    patch, latin, korean = sys.argv[1:]
+    new = glyphs(latin, LATIN, 8)
+    ko = glyphs(korean, HANGUL, 16)
+    n_lat, n_ko = len(new), len(ko)
+    new.update(ko)
+
+    head = re.compile(r"^\+/\* (\d+) 0x")
+    src = open(patch, encoding="utf-8", errors="surrogateescape").read().split("\n")
+    i = src.index(TABLE)
+    end = next(k for k in range(i + 1, len(src)) if src[k].startswith("diff --git "))
+    done = 0
+    k = i
+    while k < end:
+        m = head.match(src[k])
+        if not m:
+            k += 1
+            continue
+        c = int(m.group(1))
+        rows = new.get(c)
+        if rows is not None:
+            if c < 256:
+                assert src[k + 1].startswith("+0x"), (c, src[k + 1])
+                src[k + 1] = line(rows)
+            else:
+                assert src[k + 1].startswith("+0x") and src[k + 2].startswith("+0x"), c
+                src[k + 1] = line([r >> 8 for r in rows])
+                src[k + 2] = line([r & 0xFF for r in rows])
+            done += 1
+        k += 1
+    if done != len(new):
+        sys.exit(f"kfont: replaced {done} of {len(new)} glyphs: table layout not as expected")
+    open(patch, "w", encoding="utf-8", errors="surrogateescape").write("\n".join(src))
+    print(f"kfont: {n_lat} English glyphs from {latin.rsplit('/', 1)[-1]}, "
+          f"{n_ko} Hangul glyphs from {korean.rsplit('/', 1)[-1]}")
+
+
+main()

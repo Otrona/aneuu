@@ -1,0 +1,492 @@
+#!/usr/bin/env python3
+# hb: read a book, full screen or in the F11 panel of the desktop.
+#   hb FILE    make FILE the current book and open it: epub, pdf, docx,
+#              hwpx, hwp, odt, doc, rtf, fb2, html, txt, md
+#   hb         open the current book where you stopped
+#   hb -r      go back to the built-in Aneuu manual
+# In the desktop, F11 shows the book in a panel on the right, titled with
+# its name: F10 next page, F9 previous page, F11 again closes it.
+# Keys here: Space/Enter/Right/PgDn next page, b/Left/PgUp previous page,
+#       g first page, G last page, q/Esc close. The place is remembered.
+#       Alt+W: write about it in WordGrinder (the book's own .wg if it has
+#       one, as with bibr; else a new document in ~/web made from its text).
+# hb FILE of the book already open keeps its place (and shows any changes).
+import curses, html, html.parser, locale, os, re, sys, unicodedata, zipfile
+from xml.etree import ElementTree as ET
+
+HOME = os.path.join(os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share"), "han")
+BOOK, POS, NAME, PATH = (os.path.join(HOME, n) for n in ("book.txt", "book.pos", "book.name",
+                                                           "book.path"))
+MANUAL = "/usr/share/han/book/aneuu.txt"
+KO = bool(os.environ.get("HAN_ACTIVE"))
+
+
+def say(ko, en):
+    return ko if KO else en
+
+
+class Text(html.parser.HTMLParser):
+    """HTML to plain text: one paragraph per line, blank lines between blocks."""
+    BLOCK = {"p", "div", "li", "tr", "h1", "h2", "h3", "h4", "h5", "h6",
+             "blockquote", "pre", "dt", "dd", "section", "table", "ul", "ol"}
+
+    def __init__(self):
+        super().__init__()
+        self.out, self.cur, self.skip, self.pre = [], [], 0, 0
+
+    def flush(self, blank=False):
+        t = "".join(self.cur)
+        t = t if self.pre else " ".join(t.split())
+        if t.strip():
+            self.out.extend(t.split("\n") if self.pre else [t])
+        if blank and self.out and self.out[-1] != "":
+            self.out.append("")
+        self.cur = []
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style", "head"):
+            self.skip += 1
+        elif tag == "br":
+            self.flush()
+        elif tag in ("td", "th"):
+            if self.cur and "".join(self.cur).strip():
+                self.cur.append("  |  ")
+        elif tag in self.BLOCK:
+            self.flush(tag not in ("li", "tr", "dd"))
+            if tag == "pre":
+                self.pre += 1
+            elif tag in ("h1", "h2", "h3"):
+                self.cur.append("■ " if tag == "h1" else "▪ ")
+            elif tag == "li":
+                self.cur.append("· ")
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style", "head"):
+            self.skip = max(0, self.skip - 1)
+        elif tag in self.BLOCK:
+            self.flush(tag not in ("li", "tr", "dt"))
+            if tag == "pre":
+                self.pre = max(0, self.pre - 1)
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.cur.append(data)
+
+
+def html_text(data):
+    p = Text()
+    p.feed(data)
+    p.flush()
+    return p.out
+
+
+def epub_text(path):
+    lines = []
+    with zipfile.ZipFile(path) as z:
+        ns = {"c": "urn:oasis:names:tc:opendocument:xmlns:container",
+              "o": "http://www.idpf.org/2007/opf"}
+        opf = ET.fromstring(z.read("META-INF/container.xml")).find(".//c:rootfile", ns).get("full-path")
+        root = ET.fromstring(z.read(opf))
+        base = os.path.dirname(opf)
+        items = {i.get("id"): i.get("href") for i in root.findall(".//o:manifest/o:item", ns)}
+        for ref in root.findall(".//o:spine/o:itemref", ns):
+            href = items.get(ref.get("idref"))
+            if not href or "nav" in href.lower() or "cover" in href.lower():
+                continue
+            name = os.path.normpath(os.path.join(base, href)).replace("\\", "/")
+            try:
+                lines += html_text(z.read(name).decode("utf-8", "replace")) + [""]
+            except KeyError:
+                pass
+    return lines
+
+
+# Characters of "ambiguous" width (bullets, curly quotes, box lines...):
+# the font draws them wide, the terminal counts them narrow, and the lines
+# drift into the next pane. Plain ASCII stand-ins instead.
+FOLD = {
+    "\u00b7": "-", "\u2022": "*", "\u25aa": "*", "\u25a0": "*", "\u25cf": "*",
+    "\u25cb": "o", "\u25e6": "o", "\u203b": "*", "\u2219": "-", "\u30fb": "-",
+    "\u201c": '"', "\u201d": '"', "\u2018": "'", "\u2019": "'", "\u2026": "...",
+    "\u2013": "-", "\u2014": "--", "\u2015": "--", "\u2192": "->", "\u2190": "<-",
+    "\u2191": "^", "\u2193": "v", "\u00d7": "x", "\u00b0": " deg",
+    "\u2500": "-", "\u2501": "-", "\u2502": "|", "\u2503": "|",
+    "\u250c": "+", "\u2510": "+", "\u2514": "+", "\u2518": "+",
+    "\u251c": "+", "\u2524": "+", "\u252c": "+", "\u2534": "+", "\u253c": "+",
+    "\u00a0": " ", "\u25a1": "[ ]", "\u2610": "[ ]", "\u2611": "[x]",
+}
+
+
+def console_safe(c):
+    """True for characters fbterm draws as wide as the terminal counts them:
+    plain letters and signs, Hangul, CJK. Emoji and other newer wide signs are
+    counted differently and push the rest of the line out of its place."""
+    o = ord(c)
+    if o < 0x300 or 0xAC00 <= o <= 0xD7A3 or 0x1100 <= o <= 0x11FF or 0x3130 <= o <= 0x318F:
+        return True
+    if o > 0xFFFF or c in "\u200d\ufe0e\ufe0f":
+        return False
+    if unicodedata.east_asian_width(c) in "WF":
+        return 0x2E80 <= o <= 0xA4CF or 0xF900 <= o <= 0xFAFF or 0xFE30 <= o <= 0xFE4F or 0xFF00 <= o <= 0xFFE6
+    return True
+
+
+def fold(line):
+    if line.isascii():
+        return line
+    return "".join(FOLD.get(c, c) for c in line if c in FOLD or console_safe(c))
+
+
+def cmd_text(cmd):
+    import subprocess
+    out = subprocess.run(cmd, capture_output=True).stdout
+    if not out.strip():
+        raise ValueError(" ".join(cmd[:1]) + ": no text")
+    return out.decode("utf-8", "replace").split("\n")
+
+
+def ocr_pdf(path):
+    """A scanned PDF (pictures only): read its text with Tesseract, if added
+    (had ocr). Slow on old laptops: a few seconds or more per page."""
+    import shutil, subprocess, tempfile
+    if not shutil.which("tesseract"):
+        raise ValueError(say("글자 없이 그림만 있는 PDF (스캔) 입니다. 보기: hv 파일, "
+                             "글자로 읽기: had ocr (한 번)",
+                             "this PDF has only pictures (a scan). View it: hv FILE; read its "
+                             "text: had ocr (once)"))
+    info = subprocess.run(["pdfinfo", path], capture_output=True, text=True).stdout
+    m = re.search(r"Pages:\s+(\d+)", info)
+    pages = int(m.group(1)) if m else 1
+    have = subprocess.run(["tesseract", "--list-langs"], capture_output=True, text=True).stdout.split()
+    langs = "+".join(l for l in ("kor", "eng") if l in have) or "eng"
+    out = []
+    with tempfile.TemporaryDirectory() as tmp:
+        for n in range(1, pages + 1):
+            print(say(f"\r글자 읽는 중 (OCR) {n}/{pages} 쪽 ...", f"\rReading text (OCR) page {n}/{pages} ..."),
+                  end="", flush=True)
+            img = os.path.join(tmp, "p")
+            subprocess.run(["pdftoppm", "-r", "200", "-gray", "-png", "-f", str(n), "-l", str(n),
+                            "-singlefile", path, img], capture_output=True)
+            txt = subprocess.run(["tesseract", img + ".png", "-", "-l", langs],
+                                 capture_output=True).stdout.decode("utf-8", "replace")
+            out += txt.split("\n") + [""]
+    print()
+    if not any(l.strip() for l in out):
+        raise ValueError(say("글자를 찾지 못했습니다", "no text found"))
+    return out
+
+
+def zip_xml(path, members, para):
+    """Text of Word-style XML in a zip (docx, hwpx): a paragraph per line."""
+    out = []
+    with zipfile.ZipFile(path) as z:
+        for name in sorted(n for n in z.namelist() if re.fullmatch(members, n)):
+            x = z.read(name).decode("utf-8", "replace")
+            x = re.sub(r"</%s>" % para, "\n", x)
+            x = html.unescape(re.sub(r"<[^>]+>", "", x))
+            out.extend(x.split("\n"))
+    return out
+
+
+def load(path):
+    low = path.lower()
+    ext = low.rsplit(".", 1)[-1] if "." in low else ""
+    if ext == "epub":
+        lines = epub_text(path)
+    elif ext == "pdf":
+        try:
+            lines = cmd_text(["pdftotext", "-enc", "UTF-8", "-nopgbrk", path, "-"])
+        except ValueError:
+            lines = ocr_pdf(path)
+    elif ext == "docx":
+        lines = zip_xml(path, r"word/document\.xml", "w:p")
+    elif ext == "hwpx":
+        lines = zip_xml(path, r"Contents/section\d+\.xml", "hp:p")
+    elif ext in ("odt", "sxw"):          # paragraphs and headings of content.xml
+        x = zipfile.ZipFile(path).read("content.xml").decode("utf-8", "replace")
+        x = re.sub(r"<text:(s|tab)\b[^>]*/>", " ", x)
+        x = re.sub(r"<text:line-break/>", "\n", x)
+        x = re.sub(r"</text:(p|h)>", "\n", x)
+        x = re.sub(r"<office:body>|^.*?<office:text[^>]*>", "", x, count=1, flags=re.S)
+        lines = [l.strip() for l in html.unescape(re.sub(r"<[^>]+>", "", x)).split("\n")]
+        while lines and not lines[0]:
+            lines.pop(0)
+    elif ext == "doc":
+        lines = cmd_text(["antiword", path])
+    elif ext == "rtf":
+        lines = cmd_text(["unrtf", "--text", path])
+    elif ext == "hwp":
+        lines = cmd_text(["hwp5txt", path])
+    elif ext == "fb2":
+        lines = html_text(open(path, encoding="utf-8", errors="replace").read())
+    else:
+        data = open(path, encoding="utf-8", errors="replace").read()
+        if low.endswith((".html", ".htm", ".xhtml")):
+            lines = html_text(data)
+        else:
+            lines = data.split("\n")
+    return [fold(l) for l in lines]
+
+
+def width(s):
+    return sum(2 if unicodedata.east_asian_width(c) in "WF" else
+               0 if unicodedata.combining(c) else 1 for c in s)
+
+
+def wrap(line, w):
+    """Break one line to display width w, at a space when there is one."""
+    line = line.expandtabs(4).rstrip()
+    if not line:
+        return [""]
+    out, cur, cw, last = [], "", 0, -1
+    for ch in line:
+        n = width(ch)
+        if cw + n > w:
+            if last > 0 and ch != " ":
+                out.append(cur[:last].rstrip())
+                cur = cur[last:].lstrip()
+            else:
+                out.append(cur.rstrip())
+                cur = ""
+            cw, last = width(cur), -1
+            if ch == " " and not cur:
+                continue
+        if ch == " ":
+            last = len(cur) + 1
+        cur += ch
+        cw += n
+    out.append(cur.rstrip())
+    return out
+
+
+def to_wg(scr):
+    """Alt+W: the book in WordGrinder, to write between its lines."""
+    import subprocess
+    path = ""
+    try:
+        path = open(PATH, encoding="utf-8").read().strip()
+    except OSError:
+        pass
+    base = os.path.splitext(path)[0] if path else ""
+    wg = base + ".wg" if base and os.path.exists(base + ".wg") else ""
+    if not wg:                       # no .wg of its own: a new document from its text
+        name = os.path.splitext(open(NAME, encoding="utf-8").read().strip())[0] \
+            if os.path.isfile(NAME) else "aneuu"
+        d = os.path.expanduser("~/web")
+        os.makedirs(d, exist_ok=True)
+        wg = os.path.join(d, re.sub(r"[/\\]", "_", name) + ".wg")
+        if not os.path.exists(wg):
+            text = open(BOOK if os.path.isfile(BOOK) else MANUAL, encoding="utf-8").read()
+            page = "<html><head><meta charset='utf-8'></head><body>\n" + "\n".join(
+                f"<p>{html.escape(l)}</p>" for l in text.split("\n") if l.strip()) + "\n</body></html>"
+            tmp = wg[:-3] + ".tmp.html"
+            open(tmp, "w", encoding="utf-8").write(page)
+            subprocess.run(["/usr/bin/wordgrinder", "--convert", tmp, wg], capture_output=True)
+            os.remove(tmp)
+    if os.environ.get("TMUX"):       # a window of its own; the book stays here
+        subprocess.run(["tmux", "new-window", "-n", "write", f"han-run wordgrinder '{wg}'"])
+    else:
+        curses.endwin()
+        subprocess.run(["wordgrinder", wg])
+        scr.refresh()
+
+
+def run(scr, src, title, place, save, bible=False, reload=None):
+    curses.curs_set(0)
+    scr.keypad(True)
+    try:
+        curses.use_default_colors()
+    except curses.error:
+        pass
+
+    def layout():
+        h, w = scr.getmaxyx()
+        rows, cols = max(1, h - 1), max(8, w - 1)
+        lines, first = [], {}
+        for i, s in enumerate(src):
+            first.setdefault(i, len(lines))
+            lines.extend((i, x) for x in wrap(s, cols))
+        return rows, cols, lines, first
+
+    # a place is (paragraph, line inside it), so it survives another width
+    def find(pl):
+        t = first.get(pl[0], 0) + pl[1]
+        while t > 0 and (t >= len(lines) or lines[t][0] != pl[0]):
+            t -= 1
+        return t
+
+    def here():
+        return (lines[top][0], top - first[lines[top][0]]) if lines else (0, 0)
+
+    rows, cols, lines, first = layout()
+    top = find(place)
+    while True:
+        top = max(0, min(top, max(0, len(lines) - 1)))
+        scr.erase()
+        for y, (_, text) in enumerate(lines[top:top + rows]):
+            try:
+                scr.addstr(y, 0, text)
+            except curses.error:
+                pass
+        page, pages = top // rows + 1, max(1, -(-len(lines) // rows))
+        if os.environ.get("HAN_BOOK_PANE"):
+            bar = say(f" {page}/{pages} F10 다음 F9 앞 F11 닫기",
+                      f" {page}/{pages} F10 next F9 back F11 close")
+        elif bible == "bibt":
+            bar = say(f" {title}  {page}/{pages}  < > 날  a 장 전체  c 장 고르기  v 번역  Alt+W 쓰기",
+                      f" {title}  {page}/{pages}  < > day  a whole  c chapters  v version  Alt+W write")
+        elif bible == "bibt-pick":
+            bar = say(f" {title}  {page}/{pages}  < > 장  c 장 고르기  d 오늘 말씀  Alt+W 쓰기",
+                      f" {title}  {page}/{pages}  < > chapter  c chapters  d the day's  Alt+W write")
+        elif bible:
+            bar = say(f" {title}  {page}/{pages}  Space 다음  < > 장  c 고르기  Alt+W 쓰기  q",
+                      f" {title}  {page}/{pages}  Space next  < > chapter  c choose  Alt+W write  q")
+        else:
+            bar = say(f" {page}/{pages}  Space 다음  b 앞  q 닫기",
+                      f" {page}/{pages}  Space next  b back  q close")
+        while width(bar) > cols:
+            bar = bar[:-1]
+        try:
+            scr.addstr(rows, 0, bar + " " * (cols - width(bar)), curses.A_REVERSE)
+        except curses.error:
+            pass
+        scr.refresh()
+        save(here())                    # the panel can be closed at any moment
+
+        k = scr.getch()
+        if reload:                      # the file changed (notes written in wg): read it again
+            new = reload()
+            if new is not None:
+                keep = here()
+                src[:] = new
+                rows, cols, lines, first = layout()
+                top = find(keep)
+        if k == 27:                     # Esc alone, or a key the terminal
+            scr.nodelay(True)           # description does not know
+            seq = ""
+            while True:
+                c = scr.getch()
+                if c == -1:
+                    break
+                seq += chr(c) if 0 <= c < 256 else ""
+            scr.nodelay(False)
+            if seq in ("w", "W") and not os.environ.get("HAN_BOOK_PANE"):
+                to_wg(scr)                  # Alt+W
+                continue
+            k = {"": ord("q"), "[23~": curses.KEY_F11, "[21~": curses.KEY_F10,
+                 "[20~": curses.KEY_F9, "[6~": curses.KEY_NPAGE,
+                 "[5~": curses.KEY_PPAGE, "[C": curses.KEY_RIGHT, "[D": curses.KEY_LEFT,
+                 "[B": curses.KEY_DOWN, "[A": curses.KEY_UP, "OC": curses.KEY_RIGHT,
+                 "OD": curses.KEY_LEFT}.get(seq, -1)
+        if k in (ord("q"), ord("Q"), curses.KEY_F11):
+            break
+        if bible and k in (ord(">"), ord("."), ord("<"), ord(","), ord("c"), ord("C"),
+                           ord("a"), ord("v"), ord("d")):
+            if k == ord("a") and bible != "bibt" or k in (ord("v"), ord("d")) and not bible.startswith("bibt"):
+                continue
+            save(here())
+            return {ord(">"): 11, ord("."): 11, ord("<"): 12, ord(","): 12, ord("a"): 13,
+                    ord("v"): 14, ord("d"): 15}.get(k, 10)
+        elif k in (ord(" "), 10, 13, ord("n"), ord("j"), curses.KEY_NPAGE, curses.KEY_F10,
+                   curses.KEY_RIGHT, curses.KEY_DOWN, curses.KEY_ENTER):
+            if top + rows < len(lines):
+                top += rows
+        elif k in (ord("b"), ord("p"), ord("k"), curses.KEY_PPAGE, curses.KEY_LEFT, curses.KEY_F9,
+                   curses.KEY_UP, curses.KEY_BACKSPACE, 127):
+            top -= rows
+        elif k in (ord("g"), curses.KEY_HOME):
+            top = 0
+        elif k in (ord("G"), curses.KEY_END):
+            top = (max(0, len(lines) - 1) // rows) * rows
+        elif k == curses.KEY_RESIZE:
+            keep = here()
+            rows, cols, lines, first = layout()
+            top = find(keep)
+    return here()
+
+
+def main():
+    locale.setlocale(locale.LC_ALL, "")
+    os.makedirs(HOME, exist_ok=True)
+    args = sys.argv[1:]
+    if args and args[0] in ("-h", "--help"):
+        print("".join(l[2:] for l in open(__file__, encoding="utf-8").readlines()[1:10]), end="")
+        return 0
+    if args and args[0] == "-r":
+        for f in (BOOK, POS, NAME, PATH):
+            if os.path.exists(f):
+                os.remove(f)
+        args = []
+    if args:
+        path = args[0]
+        if not os.path.isfile(path):
+            print(say(f"hb: 파일이 없습니다: {path}", f"hb: no such file: {path}"))
+            return 1
+        try:
+            text = load(path)
+        except Exception as e:
+            print(say(f"hb: 이 파일을 읽지 못했습니다 ({e})", f"hb: cannot read this file ({e})"))
+            return 1
+        full = os.path.abspath(path)
+        try:
+            same = open(PATH, encoding="utf-8").read().strip() == full
+        except OSError:
+            same = False
+        open(BOOK, "w", encoding="utf-8").write("\n".join(text))
+        open(NAME, "w", encoding="utf-8").write(os.path.basename(path))
+        open(PATH, "w", encoding="utf-8").write(full)
+        if not same:                    # another book: from its start
+            open(POS, "w").write("0 0")
+    book = BOOK if os.path.isfile(BOOK) else MANUAL
+    if not os.path.isfile(book):
+        print(say("hb: 책이 없습니다.  hb 파일.epub", "hb: no book yet.  hb FILE.epub"))
+        return 1
+    src = [fold(l) for l in open(book, encoding="utf-8", errors="replace").read().split("\n")]
+    posfile = POS if book == BOOK else POS + ".manual"
+    try:
+        a, b = open(posfile).read().split()
+        pos = (int(a), int(b))
+    except (OSError, ValueError):
+        pos = (0, 0)
+    title = open(NAME, encoding="utf-8").read() if book == BOOK and os.path.isfile(NAME) else "Aneuu"
+    def save(pl):
+        try:
+            open(posfile, "w").write(f"{pl[0]} {pl[1]}")
+        except OSError:
+            pass
+
+    # the book's file changed (notes saved from WordGrinder): show the new text
+    reload = None
+    try:
+        srcpath = open(PATH, encoding="utf-8").read().strip() if book == BOOK else ""
+    except OSError:
+        srcpath = ""
+    if srcpath and os.path.isfile(srcpath):
+        seen = [os.path.getmtime(srcpath)]
+
+        def reload():
+            try:
+                m = os.path.getmtime(srcpath)
+            except OSError:
+                return None
+            if m == seen[0]:
+                return None
+            seen[0] = m
+            try:
+                text = load(srcpath)
+            except Exception:
+                return None
+            open(BOOK, "w", encoding="utf-8").write("\n".join(text))
+            return [fold(l) for l in text]
+    bible = "" if os.environ.get("HAN_BOOK_PANE") else os.environ.get("HAN_HB_BIBR", "")
+    if bible:
+        title = os.path.splitext(title)[0]
+    r = curses.wrapper(run, src, title, pos, save, bible, reload)
+    if isinstance(r, int):              # bibr: 10 choose, 11 next chapter, 12 previous
+        return r
+    save(r)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

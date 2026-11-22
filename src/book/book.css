@@ -1,0 +1,13 @@
+body { font-family: sans-serif; line-height: 1.7; word-break: keep-all; }
+h1 { font-size: 1.6em; margin-top: 1.2em; border-bottom: 2px solid #3a8a4a; padding-bottom: .2em; }
+h2 { font-size: 1.25em; margin-top: 1.4em; color: #2a6a38; }
+h3 { font-size: 1.05em; margin-top: 1.2em; }
+code { font-family: monospace; background: #eef3ee; padding: 0 .2em; border-radius: 3px; }
+pre { background: #10141c; color: #d8f0dc; padding: .7em .9em; border-radius: 6px; white-space: pre-wrap; }
+pre code { background: none; color: inherit; padding: 0; }
+table { border-collapse: collapse; margin: .8em 0; width: 100%; }
+th, td { border: 1px solid #b8c8bc; padding: .3em .5em; text-align: left; vertical-align: top; }
+th { background: #e2efe5; }
+blockquote { margin: 1em 0; padding: .5em .9em; border-left: 4px solid #e0a020; background: #fdf6e6; }
+dt { font-weight: bold; margin-top: .6em; }
+dd { margin-left: 1.2em; }

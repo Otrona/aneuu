@@ -1,0 +1,326 @@
+#!/usr/bin/env python3
+# web2wg URL FILE.wg: a web page's text (no menus, ads, footnote marks) as a
+# WordGrinder document, ready for your own notes under it. Used by "wg URL",
+# by "bible" and by Alt+W in w3m.
+#   web2wg --html URL FILE.html   only the cleaned page, as HTML (for checks)
+import html, html.parser, json, os, re, subprocess, sys, tempfile, urllib.request
+
+UA = {"User-Agent": "Mozilla/5.0 (X11; Linux x86_64; rv:128.0) Gecko/20100101 Firefox/128.0",
+      "Accept-Language": "ko,en;q=0.8"}
+VOID = {"br", "img", "hr", "meta", "link", "input", "source", "wbr", "area", "base", "col", "embed", "track"}
+DROP_TAGS = {"script", "style", "noscript", "svg", "form", "nav", "header", "footer", "aside",
+             "button", "select", "iframe", "template", "canvas", "video", "audio", "picture", "figure"}
+# boxes that are never the text itself (class or id)
+JUNK = re.compile(r"(^|[-_ ])(footnotes?|crossrefs?|crossreference|share|sharing|social|nav|navbar|"
+                  r"menu|breadcrumbs?|banner|promo|advert|ads?|cookie|modal|login|signup|subscribe|"
+                  r"newsletter|calendar|sidebar|toolbar|related|comments?|publisher-info-top|"
+                  r"full-chap-link|passage-other-trans|audio|dropdown-menu|hidden|skip)($|[-_ ])", re.I)
+TITLE = re.compile(r"passage-display|dropdown-display-text|(^| )bcv( |$)", re.I)
+BODY = re.compile(r"(^| )((rp-)?passage-text|bible_read)( |$)", re.I)
+RIGHTS = re.compile(r"publisher-info-bottom|copyright", re.I)
+
+
+class Node:
+    def __init__(self, tag, attrs, parent):
+        self.tag, self.parent, self.kids = tag, parent, []
+        a = dict(attrs)
+        self.cls = (a.get("class") or "") + " " + (a.get("id") or "")
+        self.attrs = a
+
+    def text(self):
+        return "".join(k if isinstance(k, str) else k.text() for k in self.kids)
+
+
+class Tree(html.parser.HTMLParser):
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.root = Node("root", [], None)
+        self.cur = self.root
+
+    def handle_starttag(self, tag, attrs):
+        n = Node(tag, attrs, self.cur)
+        self.cur.kids.append(n)
+        if tag not in VOID:
+            self.cur = n
+
+    def handle_startendtag(self, tag, attrs):
+        self.cur.kids.append(Node(tag, attrs, self.cur))
+
+    def handle_endtag(self, tag):
+        n = self.cur
+        while n is not self.root and n.tag != tag:
+            n = n.parent
+        if n is not self.root:
+            self.cur = n.parent
+
+    def handle_data(self, data):
+        self.cur.kids.append(data)
+
+
+def walk(n):
+    yield n
+    for k in n.kids:
+        if not isinstance(k, str):
+            yield from walk(k)
+
+
+def linky(n):
+    """A box that is mostly links (menus, lists of other articles)."""
+    text = len(re.sub(r"\s+", "", n.text()))
+    if text == 0:
+        return True
+    links = sum(len(re.sub(r"\s+", "", a.text())) for a in walk(n) if a.tag == "a")
+    return links / text > 0.5
+
+
+def junk(n):
+    return n.tag in DROP_TAGS or (n.cls.strip() and JUNK.search(n.cls)) or \
+        (n.tag == "sup" and re.search(r"footnote|crossreference", n.cls))
+
+
+BLOCK = {"p", "div", "li", "tr", "blockquote", "pre", "dd", "dt", "section", "article", "main",
+         "table", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6", "body"}
+
+
+def emit(n, out):
+    """Clean HTML: headings, paragraphs (one per line of poetry), bold, italic."""
+    for k in n.kids:
+        if isinstance(k, str):
+            out.append(html.escape(k))
+            continue
+        if junk(k):
+            continue
+        t = k.tag
+        if t in ("h1", "h2", "h3", "h4", "h5", "h6"):
+            out.append(f"</p>\n<{t}>{html.escape(k.text().strip())}</{t}>\n<p>")
+        elif t == "br":
+            out.append("</p>\n<p>")
+        elif t in ("b", "strong", "i", "em"):
+            tag = "b" if t in ("b", "strong") else "i"
+            out.append(f"<{tag}>")
+            emit(k, out)
+            out.append(f"</{tag}>")
+        elif t in BLOCK:
+            if t in ("ul", "ol", "div", "section", "table") and linky(k):
+                continue
+            out.append("</p>\n<p>")
+            emit(k, out)
+            out.append("</p>\n<p>")
+        else:
+            emit(k, out)
+
+
+def tidy(s):
+    s = re.sub(r"[ \t ]+", " ", s)
+    s = re.sub(r"<p>\s*</p>", "", s)
+    s = re.sub(r"<p>\s*</p>", "", s)
+    s = re.sub(r"<p>\s+", "<p>", s)
+    s = re.sub(r"\n{2,}", "\n", s)
+    return s.strip()
+
+
+def bskorea(raw):
+    """대한성서공회 (bskorea.or.kr) chapter pages: headings as headings, one
+    verse per line, the footnote marks and the hidden notes out."""
+    raw = re.sub(r"<a class=comment[^>]*>.*?</a>", "", raw, flags=re.S)
+    raw = re.sub(r"<div id='D_[^']*' class=D2.*?</div>", "", raw, flags=re.S)
+    raw = re.sub(r'<font class="smallTitle">(.*?)</font>', r"<h3>\1</h3>", raw, flags=re.S)
+    raw = re.sub(r'<font class="chapNum">.*?</font>', "", raw, flags=re.S)
+    raw = re.sub(r"<div style='text-align:right'>.*?</div>", "", raw, flags=re.S)
+    m = re.search(r'class="titleBg">\s*\[\s*(\S+)\s+(\d+):', raw)
+    v = re.search(r'class="bible_read">.*?<b>(.*?)</b>', raw, re.S)
+    raw = re.sub(r"<font style='display:none;'[^>]*>.*?</font>", "", raw, flags=re.S)
+    if v:
+        raw = raw.replace(f"<b>{v.group(1)}</b>", "", 1)
+    if m:                                   # "창세기 1장 (표준새번역)" as the first heading
+        head = f"{m.group(1)} {m.group(2)}장" + (f" ({v.group(1).strip()})" if v else "")
+        raw = raw.replace('<div id="tdBible1" class="bible_read">',
+                          '<div id="tdBible1" class="bible_read"><h1>' + html.escape(head) + "</h1>", 1)
+    return raw
+
+
+ESV_NOTE = ("Scripture quotations are from the ESV® Bible (The Holy Bible, English Standard "
+            "Version®), © 2001 by Crossway, a publishing ministry of Good News Publishers. "
+            "Used by permission. All rights reserved.")
+
+
+def clean(raw, url):
+    if "bskorea.or.kr" in url or 'class="bible_read"' in raw:
+        raw = bskorea(raw)
+    esv1517 = "1517.org/bible" in url
+    if esv1517:                              # 1517.org's Bible pages (ESV): each chapter's section
+        raw = raw.replace('<section class="description">', '<section class="passage-text">')
+        raw = re.sub(r'<small class="audio[^"]*">.*?</small>', "", raw, flags=re.S)
+    t = Tree()
+    t.feed(raw)
+    t.close()
+    nodes = list(walk(t.root))
+    title = next((n.text().strip() for n in nodes if n.tag == "title"), "") or url
+    parts, seen_titles, rights = [], set(), ""
+    # Bible Gateway (and pages built like it): each passage's reference, then its text
+    picked = []
+    for n in nodes:
+        if any(p is n or inside(n, p) for p in picked):
+            continue
+        if BODY.search(n.cls) or (TITLE.search(n.cls) and not any(BODY.search(a.cls) for a in up(n))):
+            picked.append(n)
+    if any(BODY.search(p.cls) for p in picked):
+        for n in picked:
+            if BODY.search(n.cls):
+                out = ["<p>"]
+                emit(n, out)
+                parts.append(tidy("".join(out) + "</p>"))
+            else:
+                ref = re.sub(r"\s+", " ", n.text()).strip()
+                if ref and ref not in seen_titles and len(ref) < 120:
+                    seen_titles.add(ref)
+                    parts.append(f"<h1>{html.escape(ref)}</h1>")
+        # Bible Gateway's reading plans: the date and the day's readings on top
+        m = re.search(r'"ref_display":"((?:[^"\\]|\\.)*)"', raw)
+        head = []
+        if m:                                 # the date, from "... - January 3, 2027"
+            head.append(f"<p><b>{html.escape(title.rsplit(' - ', 1)[-1])}</b></p>")
+        if m:
+            refs = html.unescape(json.loads('"' + m.group(1) + '"'))
+            head.append(f"<p>{html.escape(refs)}</p>")
+        parts[:0] = head
+        r = [n for n in nodes if RIGHTS.search(n.cls)]
+        if r:
+            rights = re.sub(r"\s+", " ", r[-1].text()).strip()
+    else:
+        # any other page, like a reader view: the box holding most of the
+        # paragraphs' text, without menus, link lists and the boxes around
+        score = {}
+        for n in nodes:
+            if n.tag == "p" and not any(junk(a) for a in up(n)):
+                text = len(n.text().strip())
+                if text < 25:
+                    continue
+                pts = text + 10 * n.text().count(",")
+                for i, a in enumerate(up(n)):
+                    if i > 2 or a is t.root:
+                        break
+                    score[id(a)] = score.get(id(a), 0) + pts / (i + 1)
+        byid = {id(n): n for n in nodes}
+        root = byid[max(score, key=score.get)] if score else \
+            next((n for n in nodes if n.tag in ("article", "main")), None) or \
+            next((n for n in nodes if n.tag == "body"), t.root)
+        h1 = next((n for n in nodes if n.tag == "h1"), None)
+        if h1 is not None and not inside(h1, root):
+            parts.append(f"<h1>{html.escape(' '.join(h1.text().split()))}</h1>")
+        out = ["<p>"]
+        emit(root, out)
+        parts.append(tidy("".join(out) + "</p>"))
+    body = "\n".join(parts)
+    if esv1517:
+        rights = ESV_NOTE
+    if rights:
+        body += f"\n<p><i>{html.escape(rights[:600])}</i></p>"
+    notes = os.environ.get("HAN_WG_NOTES", "")
+    if notes:                                # your own writing goes under this
+        body += f"\n<h2>{html.escape(notes)}</h2>"
+    return title, (f"<html><head><meta charset='utf-8'><title>{html.escape(title)}</title></head><body>\n"
+                   f"{body}\n<p>{html.escape(url)}</p>\n</body></html>\n")
+
+
+def up(n):
+    n = n.parent
+    while n is not None:
+        yield n
+        n = n.parent
+
+
+def inside(n, p):
+    return any(a is p for a in up(n))
+
+
+def fetch_direct(url):
+    req = urllib.request.Request(url, headers=UA)
+    with urllib.request.urlopen(req, timeout=40) as r:
+        data = r.read()
+        cs = r.headers.get_content_charset() or "utf-8"
+    return data.decode(cs, "replace")
+
+
+def fetch_w3m(url):
+    """The page as w3m gets it (its own name and its cookies): some sites
+    (news sites) refuse other programs but show w3m the article."""
+    r = subprocess.run(["/usr/bin/w3m", "-o", "accept_encoding=identity", "-dump_source", url],
+                       capture_output=True, timeout=60)
+    data = r.stdout
+    # -dump_source gives the bytes as sent: unpack them if the site packed them anyway
+    import bz2, gzip, zlib
+    for magic, unpack in ((b"\x1f\x8b", gzip.decompress), (b"BZh", bz2.decompress),
+                          (b"\x78", zlib.decompress)):
+        if data.startswith(magic):
+            try:
+                data = unpack(data)
+            except Exception:
+                pass
+            break
+    m = re.search(rb'charset=["\']?([\w-]+)', data[:4000])
+    try:
+        return data.decode(m.group(1).decode() if m else "utf-8", "replace")
+    except LookupError:
+        return data.decode("utf-8", "replace")
+
+
+def readable(raw):
+    """Does the page hold some text in paragraphs (not a refusal or an empty shell)?"""
+    return raw and len(re.findall(r"<p[\s>]", raw, re.I)) >= 3
+
+
+def fetch(url):
+    """Directly first; when refused or empty, the way w3m does it."""
+    err = None
+    try:
+        raw = fetch_direct(url)
+        if readable(raw):
+            return raw
+    except Exception as e:
+        err, raw = e, ""
+    if os.path.exists("/usr/bin/w3m"):
+        try:
+            alt = fetch_w3m(url)
+            if readable(alt) or not raw:
+                return alt or raw
+        except Exception:
+            pass
+    if err and not raw:
+        raise err
+    return raw
+
+
+def main():
+    a = sys.argv[1:]
+    only_html = bool(a) and a[0] == "--html"
+    if only_html:
+        a = a[1:]
+    if len(a) != 2:
+        print("usage: web2wg URL FILE.wg   |   web2wg --html URL FILE.html", file=sys.stderr)
+        return 2
+    url, dest = a
+    try:
+        raw = fetch(url)
+    except Exception as e:
+        print(f"web2wg: cannot get {url}: {e}", file=sys.stderr)
+        return 1
+    title, page = clean(raw, url)
+    if only_html:
+        open(dest, "w", encoding="utf-8").write(page)
+        return 0
+    with tempfile.TemporaryDirectory() as d:
+        src = os.path.join(d, "page.html")
+        open(src, "w", encoding="utf-8").write(page)
+        r = subprocess.run(["/usr/bin/wordgrinder", "--convert", src, dest],
+                           capture_output=True, text=True)
+    if r.returncode != 0 or not os.path.exists(dest):
+        print("web2wg: WordGrinder could not convert the page: " + (r.stderr or r.stdout)[-300:],
+              file=sys.stderr)
+        return 1
+    print(title)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

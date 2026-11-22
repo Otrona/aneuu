@@ -1,0 +1,286 @@
+#!/usr/bin/env python3
+# dic: the English dictionary (WordNet 3.0), on the console.
+#   dic WORD       look it up (ran, mice, cats, running: found as run, mouse...)
+#   dic            ask for words, one after another
+# In the desktop: Alt+D, then type the first letters of a word on the screen
+# (in wg, hb, a web page...): it is marked; Enter shows its meaning.
+#   dic --pick PANE  that word picker (what Alt+D runs)
+#   dic --buffer     look up what tmux copied last (F6 ... Enter)
+import json, os, re, subprocess, sys, unicodedata
+
+KO = bool(os.environ.get("HAN_ACTIVE"))
+B, D, R = "\033[1;36m", "\033[2m", "\033[0m"
+
+
+def say(ko, en):
+    return ko if KO else en
+
+
+def sdcv(word):
+    try:
+        r = subprocess.run(["sdcv", "-n", "-e", "-j", "--utf8-output", "--utf8-input", word],
+                           capture_output=True, text=True, timeout=10)
+        return json.loads(r.stdout or "[]")
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return None
+
+
+def forms(w):
+    """The word, then its likely dictionary forms (cats -> cat, tried -> try)."""
+    out = [w, w.lower()]
+    lw = w.lower()
+    rules = [("ies", "y"), ("ves", "f"), ("ves", "fe"), ("es", ""), ("s", ""),
+             ("ied", "y"), ("ed", ""), ("ed", "e"), ("ing", ""), ("ing", "e"),
+             ("ier", "y"), ("iest", "y"), ("er", ""), ("est", ""), ("er", "e"), ("est", "e"),
+             ("ly", ""), ("'s", ""), ("s'", "s")]
+    for end, new in rules:
+        if lw.endswith(end) and len(lw) - len(end) >= 2:
+            base = lw[: -len(end)] + new
+            out.append(base)
+            if end in ("ed", "ing", "er", "est") and len(base) > 3 and base[-1] == base[-2]:
+                out.append(base[:-1])            # stopped -> stop, bigger -> big
+    seen = []
+    for x in out:
+        if x not in seen:
+            seen.append(x)
+    return seen
+
+
+def clean(text):
+    """The word in a bit of copied text: letters, inner - and '."""
+    m = re.search(r"[A-Za-z][A-Za-z'\-]*[A-Za-z]|[A-Za-z]", text or "")
+    return m.group(0) if m else ""
+
+
+def lookup(word):
+    """(found word, definition text) or (None, suggestions text)"""
+    import glob
+    if not glob.glob("/usr/share/stardict/dic/*/*.ifo") and \
+            not glob.glob(os.path.expanduser("~/.stardict/dic/*/*.ifo")):
+        return None, say("사전 파일이 없습니다 (/usr/share/stardict/dic 에 WordNet 이 없음).",
+                         "No dictionary files (WordNet is missing from /usr/share/stardict/dic).")
+    found, defs = None, []
+    for w in forms(word):                      # the word as typed, and its base form
+        r = sdcv(w)                            # (tried: the adjective, then "try")
+        if r is None:
+            return None, say("사전이 없습니다 (sdcv 또는 WordNet 사전이 설치되지 않음).",
+                             "No dictionary (sdcv or the WordNet dictionary is missing).")
+        for x in r:
+            d = x["definition"].strip("\n")
+            if d not in defs:
+                defs.append(d)
+                found = found or w
+        if len(defs) >= 2:
+            break
+    if defs:
+        return found, "\n\n".join(defs)
+    try:                                       # nothing exact: words that look alike
+        r = subprocess.run(["sdcv", "-n", "--utf8-output", word], capture_output=True,
+                           text=True, timeout=10).stdout
+        alike = re.findall(r"^-->(.+)$", r, re.M)
+        alike = [a for a in alike if not a.startswith("WordNet")][:12]
+    except (OSError, subprocess.TimeoutExpired):
+        alike = []
+    msg = say(f"'{word}' 는 사전에 없습니다.", f"'{word}' is not in the dictionary.")
+    if alike:
+        msg += "\n" + say("비슷한 말: ", "Similar: ") + ", ".join(dict.fromkeys(alike))
+    return None, msg
+
+
+def show(word):
+    found, text = lookup(word)
+    if found is None:
+        print(text)
+        return
+    lines = text.split("\n")                     # headwords and parts of speech in colour
+    text = "\n".join(B + l + R if i == 0 or (l and not l.startswith(" ") and lines[i - 1] == "")
+                     or re.fullmatch(r" (noun|verb|adj|adv)", l) else l
+                     for i, l in enumerate(lines))
+    rows = os.get_terminal_size().lines if sys.stdout.isatty() else 999
+    if text.count("\n") + 3 < rows:
+        print(text)
+        return
+    prompt = say("q 닫기, 화살표/Space 넘기기", "q close, arrows/Space scroll")
+    subprocess.run(["less", "-R", "-c", "-P", prompt], input=text, text=True)
+
+
+def wide(c):
+    return 2 if unicodedata.east_asian_width(c) in "WF" else 0 if unicodedata.combining(c) else 1
+
+
+def fold(text, width):
+    """Wrap to width screen columns (Korean counts two)."""
+    out = []
+    for para in text.split("\n"):
+        lead = re.match(r" *", para).group(0)
+        line, cw = "", 0
+        for word in re.split(r"( )", para):
+            n = sum(wide(c) for c in word)
+            if cw + n > width and line.strip():
+                out.append(line.rstrip())
+                line, cw = lead + "   " if lead else "", len(lead) + 3 if lead else 0
+                if word == " ":
+                    continue
+            line += word
+            cw += n
+        out.append(line.rstrip())
+    return out
+
+
+def pick(pane=""):
+    """Alt+D: the screen as it is. Type the first letters of a word you see:
+    the words that start so are marked (nothing is covered); Tab moves to the
+    next one, Enter shows its meaning in a box on the right. A word not on the
+    screen: type all of it and press Enter. Keyboard only (no mouse)."""
+    import curses, locale
+    locale.setlocale(locale.LC_ALL, "")
+
+    def tm(*a):
+        return subprocess.run(["tmux", *a], capture_output=True, text=True).stdout
+
+    if not re.fullmatch(r"%\d+", pane or ""):
+        pane = tm("display-message", "-p", "#{pane_id}").strip()   # the pane under this panel
+    geo = tm("display-message", "-p", "-t", pane, "#{pane_left} #{pane_top}").split()
+    left, top = (int(geo[0]), int(geo[1])) if len(geo) == 2 else (0, 0)
+    text = tm("capture-pane", "-p", "-t", pane).rstrip("\n").split("\n")
+
+    def ui(scr):
+        curses.curs_set(1)
+        h, w = scr.getmaxyx()
+        words = []                               # (row, col, word) on the screen
+        for y, line in enumerate(text):
+            col, i = 0, 0
+            for m in re.finditer(r"[A-Za-z][A-Za-z'\-]*[A-Za-z]", line):
+                col += sum(wide(c) for c in line[i:m.start()])
+                i = m.start()
+                words.append((top + y, left + col, m.group(0)))
+        typed, sel, shown, defl, off = "", 0, "", [], 0
+        bx = w // 2                              # the meaning box: right half
+        bw = w - bx
+
+        def meaning(word):
+            found, t = lookup(word)
+            return (found or word), fold(t, bw - 4)
+
+        while True:
+            hits = [k for k, (y, x, wd) in enumerate(words)
+                    if typed and wd.lower().startswith(typed.lower())]
+            if hits:
+                sel %= len(hits)
+            scr.erase()
+            for y, line in enumerate(text):
+                try:
+                    scr.addstr(top + y, left, line)
+                except curses.error:
+                    pass
+            for n, k in enumerate(hits):        # mark the matching words, letters kept
+                y, x, wd = words[k]
+                if shown and x + len(wd) > bx:
+                    continue
+                attr = curses.A_REVERSE | (curses.A_BOLD | curses.A_UNDERLINE if n == sel else 0)
+                try:
+                    scr.addstr(y, x, wd, attr)
+                except curses.error:
+                    pass
+            win = None
+            if shown:
+                win = curses.newwin(h - 1, bw, 0, bx)
+                win.erase()
+                win.box()
+                win.addstr(0, 2, f" {shown} "[:bw - 4], curses.A_BOLD)
+                for r, l in enumerate(defl[off:off + h - 3]):
+                    bold = r + off == 0 or re.fullmatch(r" ?(noun|verb|adj|adv)|\S.*", l)
+                    try:
+                        win.addstr(1 + r, 2, l, curses.A_BOLD if bold else 0)
+                    except curses.error:
+                        pass
+            if typed:
+                tip = say(f" 찾는 단어: {typed}_   Tab 다음   Enter 뜻   Esc 지우기",
+                          f" Word: {typed}_   Tab next   Enter meaning   Esc clear")
+            elif shown:
+                tip = say(" 다른 단어: 첫 글자부터 입력   ↑↓ 넘기기   Esc 닫기",
+                          " Another word: type its start   arrows scroll   Esc close")
+            else:
+                tip = say(" 찾을 단어의 첫 글자부터 입력하세요   Esc 닫기",
+                          " Type the start of a word on the screen   Esc close")
+            try:
+                scr.addstr(h - 1, 0, tip[:w - 1].ljust(w - 1), curses.A_REVERSE)
+            except curses.error:
+                pass
+            scr.noutrefresh()
+            if win:
+                win.noutrefresh()
+            if hits:
+                y, x, wd = words[hits[sel]]
+                curses.setsyx(y, x)
+            curses.doupdate()
+            k = scr.getch()
+            if k == 27:                          # Esc: clear the typing, close the box, leave
+                if typed:
+                    typed = ""
+                elif shown:
+                    shown = ""
+                else:
+                    return
+            elif k in (10, 13, curses.KEY_ENTER):
+                if typed:
+                    word = words[hits[sel]][2] if hits else typed
+                    shown, defl = meaning(clean(word))
+                    typed, off = "", 0
+                elif not shown:
+                    return
+            elif k in (9, curses.KEY_RIGHT) and hits:
+                sel += 1
+            elif k in (curses.KEY_BTAB, curses.KEY_LEFT) and hits:
+                sel -= 1
+            elif k in (curses.KEY_BACKSPACE, 127, 8):
+                typed = typed[:-1]
+            elif shown and not typed and k in (curses.KEY_DOWN, curses.KEY_NPAGE, ord(" ")):
+                off = min(off + (1 if k == curses.KEY_DOWN else h - 4), max(0, len(defl) - (h - 3)))
+            elif shown and not typed and k in (curses.KEY_UP, curses.KEY_PPAGE):
+                off = max(0, off - (1 if k == curses.KEY_UP else h - 4))
+            elif 0 < k < 256 and (chr(k).isalpha() or chr(k) in "'-"):
+                typed += chr(k)
+                sel = 0
+
+    curses.wrapper(ui)
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] in (["-h"], ["--help"]):
+        print("".join(l[2:] for l in open(__file__, encoding="utf-8").readlines()[1:8]), end="")
+        return
+    first = None
+    if a[:1] == ["--pick"]:
+        pick(a[1] if len(a) > 1 else "")
+        return
+    if a[:1] == ["--buffer"]:
+        try:
+            first = subprocess.run(["tmux", "show-buffer"], capture_output=True,
+                                   text=True).stdout
+        except OSError:
+            first = ""
+        first = clean(first)
+        if not first:
+            print(say("화면에서 고른 단어가 없습니다.", "No word was picked on the screen."))
+    elif a:
+        first = clean(" ".join(a))
+    if first:
+        show(first)
+        if a[:1] != ["--buffer"]:
+            return
+    while True:                                  # more words, until Enter alone
+        try:
+            w = input(f"\n{D}" + say("다른 단어 (Enter 닫기) > ", "Another word (Enter closes) > ") + R)
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        w = clean(w)
+        if not w:
+            return
+        show(w)
+
+
+if __name__ == "__main__":
+    main()

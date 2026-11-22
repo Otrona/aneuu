@@ -1,0 +1,35 @@
+--- a/netsurf/frontends/framebuffer/gui.c	2026-11-18 20:30:49.571138497 +0900
++++ b/netsurf/frontends/framebuffer/gui.c	2026-11-18 20:31:21.168117108 +0900
+@@ -612,6 +612,24 @@
+ 	return true;
+ }
+ 
++/* Aneuu: Ctrl+Q quits, wherever the keyboard focus is (on the console
++ * there is no window to close and no other way out) */
++static void aneuu_quit_key(nsfb_event_t *event)
++{
++	static bool ctrl = false;
++
++	if ((event->type != NSFB_EVENT_KEY_DOWN) &&
++	    (event->type != NSFB_EVENT_KEY_UP))
++		return;
++	if ((event->value.keycode == NSFB_KEY_LCTRL) ||
++	    (event->value.keycode == NSFB_KEY_RCTRL)) {
++		ctrl = (event->type == NSFB_EVENT_KEY_DOWN);
++	} else if (ctrl && (event->type == NSFB_EVENT_KEY_DOWN) &&
++		   (event->value.keycode == NSFB_KEY_q)) {
++		fb_complete = true;
++	}
++}
++
+ static void framebuffer_run(void)
+ {
+ 	nsfb_event_t event;
+@@ -633,6 +651,7 @@
+ 			if ((event.type == NSFB_EVENT_CONTROL) &&
+ 			    (event.value.controlcode ==  NSFB_CONTROL_QUIT))
+ 				fb_complete = true;
++			aneuu_quit_key(&event);
+ 		}
+ 
+ 		fbtk_redraw(fbtk);

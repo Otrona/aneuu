@@ -1,0 +1,20 @@
+#!/bin/sh
+# Alt+G: the AI chat (gem) in a pane on the right of this desktop window;
+# Alt+G again closes it.   gempane toggle WINDOW
+# The keyboard goes to the chat; Alt+O goes back to your work (and over
+# again), F6 copies text from either side, F7 pastes it.
+w="${1:-}"
+p="$(tmux list-panes -t "$w" -F '#{pane_id} #{@hangem}' 2>/dev/null | awk '$2 == 1 { print $1; exit }')"
+if [ -n "$p" ]; then
+	tmux kill-pane -t "$p"
+	# keep the title line while the book pane (F11) is still open
+	tmux list-panes -t "$w" -F '#{@title}' | grep -q . ||
+		tmux set-option -w -u -t "$w" pane-border-status
+	exit 0
+fi
+p="$(tmux split-window -t "$w" -h -l 45% -P -F '#{pane_id}' 'HAN_GEM_PANE=1 exec gem')" || exit 0
+tmux set-option -p -t "$p" @hangem 1
+tmux set-option -p -t "$p" @title "AI"
+tmux set-option -w -t "$w" pane-border-status top
+tmux set-option -w -t "$w" pane-border-format "#{?#{@title},#[bold] #{@title} ,}"
+exit 0

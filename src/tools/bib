@@ -1,0 +1,175 @@
+#!/usr/bin/env python3
+# bib [WHICH]  a Sunday's readings of the Revised Common Lectionary, in
+# WordGrinder, to write your commentary between the lines. The Sunday's
+# name and readings come from Vanderbilt's RCL calendar
+# (lectionary.library.vanderbilt.edu), the texts from Bible Gateway.
+#   bib               this coming Sunday (today, if it is Sunday)
+#   bib +1 / -1       the Sunday after that / last Sunday (+2, -3 ...)
+#   bib 2027-01-03    the Sunday of that date (that day, or the Sunday after)
+#   bib 01-03         the same, this year
+# Saved as ~/bible/DATE.wg and DATE.odt (for LibreOffice); a day you already
+# started opens again as you left it.
+# Settings, in ~/.config/han/bible (these are the defaults):
+#   VERSION=NIV               (ESV, KJV, NRSVUE ...: see biblegateway.com/versions)
+#   TRACK=complementary       (after Pentecost: or semicontinuous)
+# Any book and chapter: bibr      The one-year plan: bibt
+import datetime, html, os, re, subprocess, sys, urllib.parse
+
+KO = bool(os.environ.get("HAN_ACTIVE"))
+CONF = os.path.join(os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config"), "han", "bible")
+CACHE = os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache"), "han")
+DIR = os.path.expanduser("~/bible")
+CAL = "https://lectionary.library.vanderbilt.edu/calendar/{year}/?season=all"
+WEB2WG = "/usr/local/lib/han/web2wg"
+
+
+def say(ko, en):
+    return ko if KO else en
+
+
+def settings():
+    s = {"VERSION": "NIV", "TRACK": "complementary"}
+    try:
+        for line in open(CONF, encoding="utf-8"):
+            m = re.match(r"\s*([A-Z]+)=\s*['\"]?([^'\"#\s]*)", line)
+            if m:
+                s[m.group(1)] = m.group(2)
+    except OSError:
+        pass
+    return s
+
+
+def sunday_of(text):
+    """The Sunday asked for: that date, or the Sunday after it."""
+    today = datetime.date.today()
+    coming = today + datetime.timedelta(days=(6 - today.weekday()) % 7)
+    if not text:
+        return coming
+    if re.fullmatch(r"[+-]\d+", text):
+        return coming + datetime.timedelta(weeks=int(text))
+    if re.fullmatch(r"\d\d-\d\d", text):
+        text = f"{today.year}-{text}"
+    d = datetime.date.fromisoformat(text)
+    return d + datetime.timedelta(days=(6 - d.weekday()) % 7)
+
+
+def church_year(d):
+    """Vanderbilt's calendar page for d: "2025-26" (from the First Sunday of Advent)."""
+    def advent(y):
+        nov27 = datetime.date(y, 11, 27)
+        return nov27 + datetime.timedelta(days=(6 - nov27.weekday()) % 7)
+    y = d.year if d >= advent(d.year) else d.year - 1
+    return f"{y}-{(y + 1) % 100:02d}"
+
+
+def web2wg():
+    from importlib.machinery import SourceFileLoader
+    return SourceFileLoader("web2wg", WEB2WG).load_module()
+
+
+def calendar(year):
+    """[(date, name, other name, [cell, ...] with [ref, ...] each)] of that church year."""
+    os.makedirs(CACHE, exist_ok=True)
+    cached = os.path.join(CACHE, f"rcl-{year}.html")
+    if os.path.exists(cached) and os.path.getsize(cached) > 10000:
+        raw = open(cached, encoding="utf-8", errors="replace").read()
+    else:
+        raw = web2wg().fetch(CAL.format(year=year))
+        open(cached, "w", encoding="utf-8").write(raw)
+    out = []
+    for row in re.findall(r"(?s)<tr>(.*?)</tr>", raw):
+        m = re.search(r'(?s)<a href="[^"]*texts/\?[^"]*">\s*(.*?)\s*</a>\s*<p>(.*?)</p>', row)
+        if not m:
+            continue
+        info = [x.strip() for x in html.unescape(re.sub(r"<[^>]+>", "|", m.group(2))).split("|") if x.strip()]
+        when = next((x for x in info if re.fullmatch(r"[A-Z][a-z]{2} \d\d, \d{4}", x)), None)
+        if not when:
+            continue
+        date = datetime.datetime.strptime(when, "%b %d, %Y").date()
+        other = next((x for x in info if x != when and not x.startswith("(")), "")
+        cells = [[html.unescape(r.strip()) for r in re.findall(r'(?s)<span title="[^"]*">([^<]*)</span>', td)]
+                 for td in re.findall(r"(?s)<td>(.*?)</td>", row)[1:]]
+        out.append((date, html.unescape(m.group(1)).strip(), other, [c for c in cells if c]))
+    return out
+
+
+def readings(cells, track):
+    """The day's references, in order. Seasons after Pentecost give two
+    tracks first (semicontinuous: reading + psalm; complementary: the same)."""
+    if len(cells) >= 4 and len(cells[0]) >= 2 and len(cells[1]) >= 2 and cells[1][-1].startswith("Psalm"):
+        first = cells[1] if track.startswith("c") else cells[0]
+        return first + [r for c in cells[2:] for r in c]
+    return [r for c in cells for r in c]
+
+
+def body(page):
+    page = page.split("<body>", 1)[-1].split("</body>", 1)[0]
+    return re.sub(r"<p>https?://[^<]*</p>\s*$", "", page.strip())
+
+
+def make(day, st, dest):
+    w = web2wg()
+    year = church_year(day)
+    try:
+        days = calendar(year)
+    except Exception as e:
+        print(say(f"성서정과 달력을 가져오지 못했습니다: {e}", f"Could not get the lectionary calendar: {e}"))
+        return False
+    found = [x for x in days if x[0] == day]
+    if not found:
+        print(say(f"{day} 는 성서정과 달력에 없습니다 ({year}).", f"{day} is not in the lectionary calendar ({year})."))
+        return False
+    _, name, other, cells = found[0]
+    refs = list(dict.fromkeys(readings(cells, st["TRACK"])))
+    parts = [f"<h1>{day.isoformat()}  {html.escape(name)}</h1>"]
+    if other:
+        parts.append(f"<p><i>{html.escape(other)}</i></p>")
+    parts.append("<p>" + html.escape("  /  ".join(refs)) + f"  ({html.escape(st['VERSION'])})</p>")
+    url = "https://www.biblegateway.com/passage/?" + urllib.parse.urlencode(
+        {"search": "; ".join(refs), "version": st["VERSION"]})
+    try:
+        parts.append(re.sub(r"<(/?)h1>", r"<\1h2>", body(w.clean(w.fetch(url), url)[1])))
+    except Exception as e:
+        parts.append(f"<p>{html.escape(say('본문을 가져오지 못함: ', 'texts not got: ') + str(e))}</p>")
+    page = "<html><head><meta charset='utf-8'></head><body>\n" + "\n".join(parts) + "\n</body></html>"
+    tmp = dest + ".tmp.html"
+    open(tmp, "w", encoding="utf-8").write(page)
+    subprocess.run(["/usr/bin/wordgrinder", "--convert", tmp, dest], capture_output=True)
+    os.remove(tmp)
+    if os.path.exists(dest):
+        subprocess.run(["/usr/bin/wordgrinder", "--convert", dest, dest[:-3] + ".odt"], capture_output=True)
+    return os.path.exists(dest)
+
+
+def main():
+    a = sys.argv[1:]
+    if a[:1] in (["-h"], ["--help"]):
+        print("".join(l[2:] for l in open(__file__, encoding="utf-8").readlines()[1:16]), end="")
+        return 0
+    test = a[:1] == ["--test"]                 # bib --test [WHICH]: build it fresh, print the text
+    if test:
+        a = a[1:]
+    try:
+        day = sunday_of(a[0] if a else "")
+    except ValueError:
+        print(say(f"날짜를 모르겠습니다: {a[0]}   예: bib 2027-01-03", f"Unknown date: {a[0]}   e.g. bib 2027-01-03"))
+        return 1
+    if a and not re.fullmatch(r"[+-]\d+", a[0]) and day.isoformat() != sunday_of("").isoformat():
+        print(say(f"주일: {day}", f"Sunday: {day}"))
+    if test:
+        f = "/tmp/bib-test.wg"
+        ok = make(day, settings(), f)
+        subprocess.run(["/usr/bin/wordgrinder", "--convert", f, "/tmp/bib-test.txt"], capture_output=True)
+        print(open("/tmp/bib-test.txt", encoding="utf-8", errors="replace").read()[:3000] if ok else "FAILED")
+        return 0
+    os.makedirs(DIR, exist_ok=True)
+    f = os.path.join(DIR, f"{day.isoformat()}.wg")
+    if not os.path.exists(f) or os.path.getsize(f) == 0:
+        print(say(f"{day} 주일 말씀을 가져오는 중...", f"Getting the readings for {day}..."))
+        if not make(day, settings(), f):
+            return 1
+    os.execvp("wg", ["wg", f])
+
+
+if __name__ == "__main__":
+    sys.exit(main())

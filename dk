@@ -1,0 +1,37 @@
+#!/bin/sh
+# dk: Docker with its data on the SSD (docker.img mounted at /var/lib/docker)
+#   dk        start Docker (mounts the image first)
+#   dk off    stop Docker and unmount (do this before unplugging the SSD)
+#   dk st     show where Docker keeps its data and how much space is free
+# Newer Docker keeps images and running containers in /var/lib/containerd,
+# so that folder goes on the SSD too (as .containerd inside docker.img).
+IMG=/run/media/theo/519CD9AD471916FF/docker.img
+D=/var/lib/docker
+C=/var/lib/containerd
+
+case "${1:-on}" in
+on)
+	[ -f "$IMG" ] || { echo "dk: $IMG not found. Open the SSD in the file manager first."; exit 1; }
+	if ! mountpoint -q "$D" || ! mountpoint -q "$C"; then
+		sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null
+		mountpoint -q "$D" || sudo mount -o loop "$IMG" "$D" || exit 1
+		sudo mkdir -p "$D/.containerd" "$C"
+		mountpoint -q "$C" || sudo mount --bind "$D/.containerd" "$C" || exit 1
+	fi
+	sudo systemctl start containerd.service docker
+	df -h "$D" | tail -n 1
+	;;
+off)
+	sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null
+	mountpoint -q "$C" && sudo umount "$C"
+	if mountpoint -q "$D"; then sudo umount "$D" && echo "dk: Docker stopped, SSD can be unplugged"
+	else echo "dk: Docker stopped"; fi
+	;;
+st)
+	mountpoint -q "$D" && echo "docker on SSD: $IMG" || echo "docker NOT on the SSD"
+	mountpoint -q "$C" && echo "containerd on SSD" || echo "containerd NOT on the SSD (would fill the laptop disk)"
+	df -h "$D" | tail -n 1
+	systemctl is-active docker
+	;;
+*) sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac

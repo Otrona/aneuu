@@ -1,0 +1,22 @@
+--- a/src/hangeul.c
++++ b/src/hangeul.c
+@@ -333,7 +333,9 @@
+           int n_decomposed = hangeul_decompose_jongseong (
+               p_status->jong, &jong_left, &jong_right);
+ 
+-          if (n_decomposed == 2)
++          /* ㄲ, ㅆ (rr, tt) are one consonant: they move to the next
++             syllable whole (닊+ㅏ => 니까, 샀+ㅏ => 사싸), not split. */
++          if (n_decomposed == 2 && jong_left != jong_right)
+             { /* 분리해서 분배. (eg) 밝+ㅏ => 발가. */
+               p_status->jong = jong_left;
+               hangeul_2beol_commit_1_and_flush (p_status, outbuf, outbuf_max,
+@@ -344,7 +346,7 @@
+                   = hangeul_remap_code (JONGSEONG, CHOSEONG, jong_right);
+               p_status->jung = hangeul_2beol_find_code (JUNGSEONG, ch);
+             }
+-          else if (n_decomposed <= 1)
++          else
+             {
+               /* 분리가능한 종성이 아니라면, 다음 모음에 뺏김.
+                *

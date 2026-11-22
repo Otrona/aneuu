@@ -1,0 +1,92 @@
+--- a/src/im_handler.c
++++ b/src/im_handler.c
+@@ -6,10 +6,52 @@
+  * that can be found in the license file.
+  */
+ 
++#define _POSIX_C_SOURCE 200809L /* Aneuu: sigprocmask, fork */
+ #include "im_handler.h"
+ #include "cc_nanny.h"
+ 
+ #include <ctype.h>
++#include <fcntl.h>
++#include <signal.h>
++#include <sys/wait.h>
++#include <unistd.h>
++
++/* Aneuu: tell the desktop (tmux status bar) whether Korean is on, by
++   running /usr/local/lib/han/imestate ko|en.  Double fork with SIGCHLD
++   blocked, so ddakong's main loop never sees the helper end. */
++static void
++han_ime_notify (BOOL on)
++{
++  const char *hook = "/usr/local/lib/han/imestate";
++  sigset_t set, old;
++  if (access (hook, X_OK) != 0)
++    return;
++  sigemptyset (&set);
++  sigaddset (&set, SIGCHLD);
++  sigprocmask (SIG_BLOCK, &set, &old);
++  pid_t pid = fork ();
++  if (pid == 0)
++    {
++      sigprocmask (SIG_SETMASK, &old, NULL);
++      if (fork () != 0)
++        _exit (0);
++      int fd = open ("/dev/null", O_RDWR);
++      if (fd >= 0)
++        {
++          dup2 (fd, 0);
++          dup2 (fd, 1);
++          dup2 (fd, 2);
++        }
++      for (int i = 3; i < 256; i++)
++        close (i);
++      setsid ();
++      execl (hook, hook, on ? "ko" : "en", (char *)NULL);
++      _exit (127);
++    }
++  if (pid > 0)
++    waitpid (pid, NULL, 0);
++  sigprocmask (SIG_SETMASK, &old, NULL);
++}
+ 
+ #include "hangeul.h"
+ #include "im_handler_hangeul.h"
+@@ -123,6 +165,7 @@
+         {
+           /* TOGGLE key */
+           p_status->im_mode = ~(p_status->im_mode);
++          han_ime_notify (p_status->im_mode ? TRUE : FALSE);
+ 
+           if (p_status->im_mode == FALSE)
+             {
+--- a/src/main_ddakong.c
++++ b/src/main_ddakong.c
+@@ -128,15 +128,22 @@
+ void
+ trap_chld (const int signo UNUSED)
+ {
+-  pid_t pid;
+-  int status, exitcode;
++  pid_t pid = -1;
++  int status = 0, st, exitcode;
+ 
+   while (1)
+     {
+-      pid = waitpid (-1, &status, WNOHANG);
+-      if (pid <= 0)
++      pid_t got = waitpid (-1, &st, WNOHANG);
++      if (got <= 0)
+         break;
++      if (got == child_pid)  /* Aneuu: only the shell's end ends ddakong */
++        {
++          pid = got;
++          status = st;
++        }
+     }
++  if (pid != child_pid)
++    return;
+   exitcode = WEXITSTATUS (status);
+ 
+   if (verbose_flag)
