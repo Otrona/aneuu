@@ -1,6 +1,6 @@
 # 다시 (Aneuu)
 
-옛 노트북을 되살리는 한글 콘솔 리눅스 (a Korean console Linux that brings old laptops back to life).
+구형 랩탑용(ram 2g+) 한글 콘솔 리눅스 (a Korean console Linux that brings old laptops back to life).
 
 다시 is based on Alpine Linux 3.24 and runs from a USB stick in RAM, or from a disk.
 It's made for Korean beginners.
