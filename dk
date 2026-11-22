@@ -5,13 +5,15 @@
 #   dk st     show where Docker keeps its data and how much space is free
 # Newer Docker keeps images and running containers in /var/lib/containerd,
 # so that folder goes on the SSD too (as .containerd inside docker.img).
-IMG=/run/media/theo/519CD9AD471916FF/docker.img
+# docker.img: DK_IMG if set, else the first one on a disk the file manager
+# mounted (/run/media/YOU/DISK/docker.img)
+IMG=${DK_IMG:-$(ls /run/media/"$(id -un)"/*/docker.img 2>/dev/null | head -n1)}
 D=/var/lib/docker
 C=/var/lib/containerd
 
 case "${1:-on}" in
 on)
-	[ -f "$IMG" ] || { echo "dk: $IMG not found. Open the SSD in the file manager first."; exit 1; }
+	[ -f "$IMG" ] || { echo "dk: no docker.img found. Open the SSD in the file manager first (or: DK_IMG=/path/docker.img dk)."; exit 1; }
 	if ! mountpoint -q "$D" || ! mountpoint -q "$C"; then
 		sudo systemctl stop docker.service docker.socket containerd.service 2>/dev/null
 		mountpoint -q "$D" || sudo mount -o loop "$IMG" "$D" || exit 1

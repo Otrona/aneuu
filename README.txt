@@ -34,16 +34,22 @@ Safety net: Docker refuses to start unless the SSD image is mounted.
 
 2. Docker's disk image on the SSD (once)
 ---------------------------------------
-Open the SSD in the file manager so it is mounted, then check it:
+Open the SSD in the file manager so it is mounted. Its folder is
+/run/media/YOU/DISK (YOU: your login name, DISK: the disk's name or ID);
+keep it in SSD for the commands below, for example:
 
-  ls /run/media/theo/519CD9AD471916FF
-  df -h /run/media/theo/519CD9AD471916FF        (needs 40 GB free)
+  SSD=/run/media/$USER/MYDISK
+
+Then check it:
+
+  ls $SSD
+  df -h $SSD        (needs 40 GB free)
 
 If docker.img is not there yet, make it: a 40 GB file holding a Linux
 (ext4) file system. It only uses space on the SSD as it fills.
 
-  sudo truncate -s 40G /run/media/theo/519CD9AD471916FF/docker.img
-  sudo mkfs.ext4 -F -L docker /run/media/theo/519CD9AD471916FF/docker.img
+  sudo truncate -s 40G $SSD/docker.img
+  sudo mkfs.ext4 -F -L docker $SSD/docker.img
 
 Clear what the install left on the system disk:
 
@@ -53,7 +59,7 @@ Clear what the install left on the system disk:
 
 3. The files, and the dk command
 --------------------------------
-  cd /run/media/theo/519CD9AD471916FF
+  cd $SSD
   mkdir -p aneuu && cd aneuu
   tar -xzf ~/Downloads/aneuu-0.tar.gz --strip-components=1
   chmod +x mkiso avm dk
